@@ -1,0 +1,31 @@
+help
+ps
+ls /
+cat /etc/passwd
+echo ==============================
+echo   RISKY OS v3 Demo
+echo ==============================
+echo
+echo --- Creating files ---
+mkfile /hello
+write /hello Hello from RISKY OS v3!
+cat /hello
+echo
+echo --- Nested directories ---
+mkdir /logs
+mkfile /logs/boot
+write /logs/boot System booted successfully
+cat /logs/boot
+echo
+echo --- Directory listings ---
+ls /
+ls /logs
+echo
+echo --- Process listing ---
+ps
+echo
+echo --- Pipes ---
+pipe
+echo
+echo Done. Halting.
+exit

@@ -1,0 +1,38 @@
+#!/bin/bash
+# RISKY C toolchain driver: compile + assemble (+ optionally simulate)
+#
+#   ./cc prog.c            -> prog.asm + prog.hex
+#   ./cc -r prog.c         -> also run prog.hex in the simulator
+#   ./cc -r prog.c input   -> run with 'input' preloaded as stdin ROM
+#
+# The .hex file can be loaded into the instruction ROM in Logisim.
+
+set -e
+
+dir="$(cd "$(dirname "$0")" && pwd)"
+
+run=0
+if [ "$1" = "-r" ]; then
+    run=1
+    shift
+fi
+
+src="$1"
+if [ -z "$src" ]; then
+    echo "usage: cc [-r] prog.c [inputfile]"
+    exit 1
+fi
+
+base="${src%.*}"
+
+python3 "$dir/risky_c.py" "$src" -o "$base.asm"
+python3 "$dir/risky_asm.py" "$base.asm" "$base.hex"
+echo "built $base.hex"
+
+if [ "$run" = 1 ]; then
+    if [ -n "$2" ]; then
+        python3 "$dir/risky_sim.py" "$base.hex" -i "$2"
+    else
+        python3 "$dir/risky_sim.py" "$base.hex"
+    fi
+fi
