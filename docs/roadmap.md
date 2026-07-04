@@ -1,0 +1,154 @@
+# Roadmap — Future Ideas
+
+Features discussed but not yet implemented. Roughly ordered by impact.
+
+## OS improvements
+
+### IPC & concurrency
+- **Proper pipe semantics:** `pipe_read` should block when the buffer is
+  empty (not just return 0). `pipe_write` should block when the buffer
+  is full. Currently both return short counts.
+- **Pipe between processes in the shell:** `echo hello | cat` — fork a
+  writer process with stdout redirected to the pipe, fork a reader with
+  stdin from the pipe. Requires `dup2`-style FD redirection.
+- **Signals:** simple software signals (SIGCHLD for child exit, SIGPIPE
+  for broken pipe). No signal handlers needed initially — just default
+  actions.
+- **Priority scheduling:** add a `priority` field; `sched_next()`
+  chooses the highest-priority ready task.
+- **Sleep/wakeup:** `proc_sleep(ticks)` — block for N scheduler
+  activations. Needs a tick counter incremented on each context switch.
+
+### File system
+- **Multi-page storage:** use pages 1–7 for file data. Inode block
+  pointers encode `(page << 16) | addr`. Requires careful page switching
+  during I/O — all stack accesses must complete before switching pages.
+  Need a kernel buffer at a fixed address to bounce data through.
+- **Indirect blocks:** add a 9th block pointer that points to a block of
+  256 block pointers. Increases max file size from 2048 to ~65K words.
+- **Free block bitmap:** replace the bump allocator with a proper bitmap
+  across pages 1–7. Enables file deletion and space reuse.
+- **File deletion:** `unlink(path)` — mark inode free, free its blocks,
+  remove the directory entry.
+- **File truncation:** `ftruncate(fd, size)` — grow or shrink a file.
+- **Subdirectories in path resolution:** the current shell only creates
+  files in the root or one level deep. Path resolution already supports
+  arbitrary depth; the shell commands need updating.
+- **`.`` and `..` directory entries:** standard Unix convention.
+- **File permissions:** simple owner/group/other read/write bits.
+  Cosmetic with no user authentication, but useful for the API.
+- **Device files:** `/dev/tty` (terminal), `/dev/rom` (input ROM),
+  `/dev/pipe` — open by path instead of special syscalls.
+- **Mount points:** mount a page as a filesystem volume.
+
+### Executable programs
+- **ELF-like binary format:** a header with magic, entry point, code
+  size, data size. `sys_exec(path)` loads the binary from the FS,
+  copies code/data into a new process's memory, and spawns it.
+- **Shared libraries:** load a library binary once, map it into multiple
+  processes. Needs position-independent code or a linking loader.
+- **Shell as a user program:** the shell should be loadable via
+  `sys_exec("/bin/sh")` rather than compiled into the kernel.
+- **`#!` script support:** if a file starts with `#!`, interpret the
+  rest of the first line as a command to run with the file as input.
+
+### Device drivers
+- **Block device abstraction:** `bread(dev, block)` / `bwrite(dev, block)`.
+  The FS sits on top of this instead of raw page access.
+- **Terminal driver:** line buffering, backspace handling, cursor
+  positioning escape sequences (if the Logisim TTY supports them).
+- **Timer interrupt:** if the Logisim circuit is extended with a timer,
+  add preemptive scheduling (time slices) and `sleep()`.
+
+## Compiler improvements
+
+### Language features
+- **`const`:** currently parsed but ignored. Could place variables in a
+  read-only section or at least warn on write attempts.
+- **`volatile`:** currently parsed but ignored. Relevant for
+  memory-mapped I/O (terminal, ROM).
+- **`static` functions:** file-scope visibility. Currently all functions
+  are global (dead-code elimination partially mitigates this).
+- **K&R-style function definitions:** `int foo(a, b) int a; char *b; { ... }`
+- **`continue` in `for` loops:** the current implementation of continue
+  in for loops may not correctly execute the post-expression before the
+  condition check.
+- **Wider integer types:** 32-bit `long` using register pairs (er0–er7).
+  Would need compiler support for double-word arithmetic codegen.
+- **`unsigned` arithmetic:** currently accepted but operations use signed
+  semantics. Need separate unsigned comparison and division codegen.
+
+### Optimisation
+- **Peephole optimiser:** scan the generated asm for patterns like
+  `push r0; pop r1` → `mov r1,r0`, or redundant `stoo`/`ldo` pairs.
+- **Register allocation:** currently r0 is the sole accumulator.
+  Using r1–r3 for temporary values could reduce push/pop overhead.
+- **Constant folding in codegen:** the parser evaluates constant
+  expressions for array sizes and global initializers, but run-time
+  expressions like `2 + 3` still generate `in r0,#2; push r0; in r0,#3;
+  pop r1; add r0,r1,r0` instead of `in r0,#5`.
+- **Tail call optimisation:** if a `return` statement directly calls a
+  function, replace `call + ret` with `jmp`.
+
+### Debugging
+- **Source-level debugging:** emit line number information as asm
+  comments. The simulator could map PC → source line.
+- **`__FILE__` and `__LINE__` macros:** standard C predefined macros.
+- **`#pragma message`:** print a diagnostic during preprocessing.
+- **`-Wall` mode:** enable warnings for implicit declarations, unused
+  variables, type mismatches.
+
+## Simulator improvements
+
+- **TTY emulation:** 32×8 character display with proper wrapping and
+  scrolling, matching the Logisim TTY dimensions.
+- **Memory watchpoints:** `--watch 0xADDR` to log reads/writes to a
+  specific address.
+- **Profile mode:** `--profile` to count instructions by opcode and
+  report hot functions.
+- **Interactive debugger:** breakpoints, single-step, register/memory
+  inspection. `--debug` flag drops into a REPL.
+- **Verilog/VCD output:** generate a waveform trace for debugging the
+  Logisim circuit against the simulator.
+- **Coverage:** track which instructions are exercised by a test
+  program; report gaps in ISA coverage.
+
+## Toolchain integration
+
+- **Makefile / build system:** a `Makefile` or `build.py` that compiles
+  the OS and all demos with one command.
+- **`as` compatibility mode:** accept GNU as syntax (`.globl`, `.word`,
+  `.section`) to simplify porting existing assembly code.
+- **Binary utilities:** `objdump`-style disassembler for `.hex` files.
+- **ROM image builder:** combine multiple `.hex` files (bootloader,
+  kernel, user programs) into a single ROM image for the Logisim
+  instruction ROM.
+
+## Hardware (RISKY.circ) ideas
+
+- **Keyboard input:** add a Logisim Keyboard component to the circuit,
+  wired to page 0xb or a new page. The `jkb` instruction already exists
+  in the ISA for this purpose.
+- **Timer/counter:** a hardware timer generating periodic interrupts.
+  Enables preemptive scheduling and `sleep()`.
+- **UART/serial:** a simple serial transmitter for communicating with
+  another RISKY instance or a host PC.
+- **Bitmapped display:** a larger display buffer (e.g. 128×64 pixels)
+  mapped to a dedicated page. Enables graphics demos.
+- **Memory-mapped ALU:** expose ALU operations as memory-mapped
+  registers so the CPU can read result flags without `LDSTATE`.
+
+## OS userland
+
+- **`init` process:** a proper init that reads `/etc/inittab` and spawns
+  getty processes on terminals.
+- **`getty` + `login`:** prompt for username/password, authenticate
+  against `/etc/passwd`, exec the user's shell.
+- **Standard Unix utilities:** `cp`, `mv`, `rm`, `mkdir -p`, `wc`,
+  `head`, `tail`, `grep`, `sort`, `diff`.
+- **Ed/sed:** a simple line editor or stream editor.
+- **A BASIC interpreter:** integer BASIC, interactive via the terminal.
+- **A FORTH system:** FORTH is a natural fit for a small word-addressed
+  machine — the dictionary and stack map directly to hardware concepts.
+- **Network stack:** if a UART is added, implement SLIP or PPP, then a
+  minimal TCP/IP stack (or just UDP for simple datagrams).

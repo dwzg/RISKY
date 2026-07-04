@@ -16,20 +16,18 @@ RISKY/
 │   ├── risky_sim.py  ISA simulator
 │   ├── cc            Driver script (compile → assemble → simulate)
 │   ├── lib/          Header-only libc (stdio, stdlib, string, ctype, softfloat)
-│   ├── tests/        17-language conformance tests
-│   ├── v1/           Historical v1 compiler
-│   └── v2/           Historical v2 compiler
+│   └── tests/        17 language conformance tests
 ├── os/               Multitasking OS + demos
-│   ├── kernel.c      Cooperative multitasking OS (processes, pipes, FS, shell)
-│   ├── rom.txt       Shell script (simulator input)
-│   ├── rom.hex       Shell script (Logisim ROM image, page 0xb)
-│   └── demos/        Standalone demo programs
-├── docs/             Documentation
-│   ├── isa.txt       Instruction set reference
-│   ├── c-grammar.txt C grammar supported by the compiler
-│   └── c89-standard.pdf  ANSI C89 standard
-└── legacy/           Historical assembler + example programs
-    └── Assembler/
+│   ├── kernel.c      Cooperative multitasking OS
+│   ├── rom.txt/hex   Shell input (simulator / Logisim ROM)
+│   └── demos/        Standalone programs
+└── docs/             Documentation
+    ├── isa.txt       Instruction set reference
+    ├── compiler.md   Compiler design, pipeline, dialect, deviations
+    ├── assembler.md  Assembler pipeline, pseudo-ops, encoding formats
+    ├── simulator.md  Machine model, I/O, flags, hardware differences
+    ├── os.md         Kernel architecture, IPC, FS, shell
+    └── roadmap.md    Future features and ideas
 ```
 
 ## Quick start
