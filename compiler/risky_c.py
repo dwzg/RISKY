@@ -1164,8 +1164,8 @@ class FunctionCall(Node):
                 # Promote int to long if needed
                 if not isLong(argType):
                     code += "\n\tmov r1,r0\n\tin r0,#0"
-                # Push hi first, then lo → hi at r15+3, lo at r15+4
-                code += "\n\tpush r0\n\tpush r1"
+                # Push lo first, then hi → hi at r15+3, lo at r15+4
+                code += "\n\tpush r1\n\tpush r0"
                 totalWords += 2
             else:
                 code += "\n\tpush r0"
@@ -1734,8 +1734,22 @@ class Assignment(Node):
 
     def generate(self, scope):
         if self.operator == "=":
-            valueCode = self.valueExpression.generate(scope)
-            valueType = self.valueExpression.ctype
+            targetType = self.target.ctype if hasattr(self.target, 'ctype') else None
+            # Peek at target type before generating value
+            if targetType is None and isinstance(self.target, VariableAccess):
+                s = self.target.resolve(scope)
+                if not isinstance(s, str) and s is not None:
+                    targetType = s.ctype
+            # For 32-bit targets with constant values, emit full 32-bit
+            if is32Bit(targetType) and isinstance(self.valueExpression, (Constant, FloatConstant)):
+                if isinstance(self.valueExpression, FloatConstant):
+                    valueCode = self.valueExpression.generate(scope)
+                else:
+                    valueCode = emitLongConstant(self.valueExpression.value)
+                valueType = targetType
+            else:
+                valueCode = self.valueExpression.generate(scope)
+                valueType = self.valueExpression.ctype
             addressCode = self.target.generateAddress(scope)
             targetType = self.target.ctype
             self.ctype = targetType

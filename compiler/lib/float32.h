@@ -136,99 +136,135 @@ long f32_add(long a, long b)
 
 long f32_sub(long a, long b) { return f32_add(a, f32_neg(b)); }
 
-/* ---- multiply (reduced precision) ---- */
+/* ---- multiply (14-bit mantissa, decent precision) ---- */
 
 long f32_mul(long a, long b)
 {
-    long ta, tb;
-    int sa, sb, ea, eb, e, ml, mr, mhi, mlo;
-    int prod;
-    /* extract */
+    long ta, tb, prod;
+    int sa, sb, ea, eb, e, sign, mhi, mlo;
+    int ma14, mb14, phi, plo;
+
     ta = a >> 16; tb = b >> 16;
     sa = (int)(ta & 0x8000); sb = (int)(tb & 0x8000);
-    ea = (int)((ta & 0x7F80) >> 7); eb = (int)((tb & 0x7F80) >> 7);
+    ta = ta & 0x7F80; ea = (int)(ta >> 7);
+    tb = tb & 0x7F80; eb = (int)(tb >> 7);
+    ta = a >> 16; tb = b >> 16;
+    sign = sa ^ sb;
 
     /* NaN / inf / zero */
-    if ((ea == 255 && ((int)(ta & 0x7F) || (int)(a & 0xFFFF))) ||
-        (eb == 255 && ((int)(tb & 0x7F) || (int)(b & 0xFFFF))))
-        return f32_make(0x7FC0, 0);
     if (ea == 255 || eb == 255) {
+        if ((ea == 255 && ((int)(ta & 0x7F) || (int)(a & 0xFFFF))) ||
+            (eb == 255 && ((int)(tb & 0x7F) || (int)(b & 0xFFFF))))
+            return f32_make(0x7FC0, 0);
         if ((ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0) ||
             (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0))
             return f32_make(0x7FC0, 0);
-        return f32_make((sa ^ sb) | 0x7F80, 0);
+        return f32_make(sign | 0x7F80, 0);
     }
     if ((ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0) ||
         (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0))
-        return f32_make(sa ^ sb, 0);
-    if (ea == 0 || eb == 0) return f32_make(sa ^ sb, 0);
+        return f32_make(sign, 0);
+    if (ea == 0 || eb == 0) return f32_make(sign, 0);
 
+    /* 14-bit mantissa multiply using long arithmetic */
+    ma14 = (((int)(ta & 0x7F) | 0x80) << 6) | (((int)(a & 0xFFFF) >> 10) & 0x3F);
+    mb14 = (((int)(tb & 0x7F) | 0x80) << 6) | (((int)(b & 0xFFFF) >> 10) & 0x3F);
     e = ea + eb - 127;
+    prod = (long)ma14 * (long)mb14;  /* 28-bit product */
 
-    /* 14-bit mantissa multiply */
-    ml = (((int)(ta & 0x7F) | 0x80) << 6) | (((int)(a & 0xFFFF) >> 10) & 0x3F);
-    mr = (((int)(tb & 0x7F) | 0x80) << 6) | (((int)(b & 0xFFFF) >> 10) & 0x3F);
-    prod = (ml >> 7) * (mr >> 7);  /* approximate high bits */
+    /* Extract and normalize. Product has binary point after bit 27.
+     * Implicit 1 should be at bit 27. */
+    {
+        long t;
+        t = prod >> 16;
+        phi = (int)(t & 0xFFFF);
+        plo = (int)(prod & 0xFFFF);
 
-    if (prod & 0x2000) {
-        mhi = (prod >> 6) & 0x7F;
-        mlo = (prod << 10) & 0xFFFF;
-    } else {
-        mhi = (prod >> 5) & 0x7F;
-        mlo = (prod << 11) & 0xFFFF;
-        e = e - 1;
+        /* Find the leading 1 position in the 28-bit phi:plo */
+        if (phi == 0 && plo == 0) return f32_make(sign, 0);
+
+        /* Normalize: shift so bit 27 (0x800 in phi) is set */
+        while (phi < 0x800 && e > 0) {
+            phi = (phi << 1) | ((plo >> 15) & 1);
+            plo = (plo << 1) & 0xFFFF;
+            e = e - 1;
+        }
+        /* If phi >= 0x1000, shift right */
+        while (phi >= 0x1000) {
+            plo = (plo >> 1) | ((phi & 1) ? 0x8000 : 0);
+            phi = phi >> 1;
+            e = e + 1;
+        }
+
+        /* Extract 23-bit mantissa from phi:plo (bits 26-4) */
+        mhi = ((phi & 0x7FF) >> 4) & 0x7F;
+        mlo = ((phi & 0xF) << 12) | ((plo >> 4) & 0xFFF);
     }
 
-    if (e >= 255) return f32_make((sa ^ sb) | 0x7F80, 0);
-    if (e <= 0) return f32_make(sa ^ sb, 0);
-    return f32_make((sa ^ sb) | (e << 7) | mhi, mlo);
+    if (e >= 255) return f32_make(sign | 0x7F80, 0);
+    if (e <= 0) return f32_make(sign, 0);
+    return f32_make(sign | (e << 7) | mhi, mlo);
 }
 
-/* ---- divide (reduced precision) ---- */
+/* ---- divide ---- */
 
 long f32_div(long a, long b)
 {
     long ta, tb;
-    int sa, sb, ea, eb, e, num, den, q, rem, count, mhi, mlo;
+    int sa, sb, ea, eb, e, sign, mhi, mlo;
+    int num, den, q, rem, count;
+
     ta = a >> 16; tb = b >> 16;
     sa = (int)(ta & 0x8000); sb = (int)(tb & 0x8000);
-    ea = (int)((ta & 0x7F80) >> 7); eb = (int)((tb & 0x7F80) >> 7);
+    ta = ta & 0x7F80; ea = (int)(ta >> 7);
+    tb = tb & 0x7F80; eb = (int)(tb >> 7);
+    ta = a >> 16; tb = b >> 16;
+    sign = sa ^ sb;
 
-    if ((ea == 255 && ((int)(ta & 0x7F) || (int)(a & 0xFFFF))) ||
-        (eb == 255 && ((int)(tb & 0x7F) || (int)(b & 0xFFFF))))
-        return f32_make(0x7FC0, 0);
-    if (ea == 255 && eb == 255) return f32_make(0x7FC0, 0);
-    if (ea == 255) return f32_make((sa ^ sb) | 0x7F80, 0);
-    if (eb == 255 || (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0)) {
+    if (ea == 255 || eb == 255) {
+        if ((ea == 255 && ((int)(ta & 0x7F) || (int)(a & 0xFFFF))) ||
+            (eb == 255 && ((int)(tb & 0x7F) || (int)(b & 0xFFFF))))
+            return f32_make(0x7FC0, 0);
+        if (ea == 255 && eb == 255) return f32_make(0x7FC0, 0);
+        if (ea == 255) return f32_make(sign | 0x7F80, 0);
+        return f32_make(sign, 0);
+    }
+    if (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0) {
         if (ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0)
             return f32_make(0x7FC0, 0);
-        return f32_make((sa ^ sb) | 0x7F80, 0);
+        return f32_make(sign | 0x7F80, 0);
     }
     if (ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0)
-        return f32_make(sa ^ sb, 0);
-    if (ea == 0 || eb == 0) return f32_make(sa ^ sb, 0);
+        return f32_make(sign, 0);
+    if (ea == 0 || eb == 0) return f32_make(sign, 0);
 
     e = ea - eb + 127;
-    num = (((int)(ta & 0x7F) | 0x80) << 7) | (((int)(a & 0xFFFF) >> 9) & 0x7F);
-    den = (((int)(tb & 0x7F) | 0x80) << 5) | (((int)(b & 0xFFFF) >> 11) & 0x1F);
 
+    /* 16-bit mantissa divide: num = 1.M (top 16 bits), den = 1.M (top 16 bits) */
+    num = (((int)(ta & 0x7F) | 0x80) << 8) | (((int)(a & 0xFFFF) >> 8) & 0xFF);
+    den = (((int)(tb & 0x7F) | 0x80) << 8) | (((int)(b & 0xFFFF) >> 8) & 0xFF);
+
+    /* Restoring division with 13 fractional bits */
     rem = num; q = 0; count = 0;
-    while (count < 12) {
+    while (count < 13) {
         rem = rem << 1; q = q << 1;
         if (rem >= den) { rem = rem - den; q = q | 1; }
         count = count + 1;
     }
 
-    if (q & 0x800) {
-        mhi = (q >> 5) & 0x7F; mlo = (q << 11) & 0xFFFF;
+    /* Normalize quotient */
+    if (q & 0x1000) {
+        mhi = (q >> 5) & 0x7F;
+        mlo = (q << 11) & 0xFFFF;
     } else {
         e = e - 1;
-        mhi = (q >> 4) & 0x7F; mlo = (q << 12) & 0xFFFF;
+        mhi = (q >> 4) & 0x7F;
+        mlo = (q << 12) & 0xFFFF;
     }
 
-    if (e >= 255) return f32_make((sa ^ sb) | 0x7F80, 0);
-    if (e <= 0) return f32_make(sa ^ sb, 0);
-    return f32_make((sa ^ sb) | (e << 7) | mhi, mlo);
+    if (e >= 255) return f32_make(sign | 0x7F80, 0);
+    if (e <= 0) return f32_make(sign, 0);
+    return f32_make(sign | (e << 7) | mhi, mlo);
 }
 
 /* ---- comparison ---- */
