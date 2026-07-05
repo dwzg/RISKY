@@ -192,7 +192,8 @@ def assemble(lines, quiet=True):
             if registers_special[arg[1]][1] == "":
                 fail("cannot write special register '" + arg[1] + "'", line)
             expanded.append(registers_special[arg[1]][1] + " " + arg[2])
-        elif arg[0] in ops_alu and arg[1] in registers_32bit:
+        elif arg[0] in ops_alu and not arg[0].endswith("32") \
+                and arg[1] in registers_32bit:
             expanded.append(arg[0] + "32 " + arg[1] + "," + arg[2])
         elif arg[0] in ops_alu and not arg[0].endswith("i") and len(arg) > 2 \
                 and arg[-1] not in registers and len(arg) == 3:

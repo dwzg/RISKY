@@ -79,6 +79,11 @@ punctuators = [
 tokenPattern = re.compile(
     r'"(?:\\.|[^"\\])*"'                       # string literal
     r"|'(?:\\.|[^'\\])+'"                      # character constant
+    # float literal: digit sequences containing . or e/E, optional f/F suffix
+    r"|\d+\.\d*([eE][+-]?\d+)?[fF]?"           # 3.14f, 3.f
+    r"|\.\d+([eE][+-]?\d+)?[fF]?"              # .5f
+    r"|\d+[eE][+-]?\d+[fF]?"                   # 1e10f (no dot)
+    r"|0[xX][0-9a-fA-F]+\.[0-9a-fA-F]*[pP][+-]?\d+[fF]?"  # hex float
     r"|0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*"    # numeric constant
     r"|[A-Za-z_]\w*"                           # identifier / keyword
     r"|" + "|".join(re.escape(p) for p in punctuators) +
@@ -86,6 +91,13 @@ tokenPattern = re.compile(
 
 escapes = {"n": 10, "t": 9, "r": 13, "0": 0, "\\": 92, "'": 39,
            '"': 34, "a": 7, "b": 8, "f": 12, "v": 11}
+
+
+def floatToBinary32(f):
+    """Convert a Python float to IEEE-754 binary32 bit pattern (as 32-bit int)."""
+    import struct
+    bits = struct.unpack('<I', struct.pack('<f', f))[0]
+    return bits & 0xffffffff
 
 
 def decodeEscapes(text, line):
@@ -139,19 +151,35 @@ def lexLine(text, line):
             if len(decoded) != 1:
                 fail("invalid character constant " + t, line)
             tokens.append(Token("CONSTANT", t, line, ord(decoded)))
-        elif t[0].isdigit():
-            number = t.rstrip("uUlL")
-            if number.lower().startswith("0x"):
-                value = int(number, 16)
-            elif number.startswith("0") and len(number) > 1:
-                value = int(number, 8)
-            else:
-                value = int(number)
-            tokens.append(Token("CONSTANT", t, line, value))
-        elif t[0].isalpha() or t[0] == "_":
-            tokens.append(Token(t if t in keywords else "IDENTIFIER", t, line))
         elif t in punctuators or t == "#":
             tokens.append(Token(t, t, line))
+        elif t[0].isdigit() or t[0] == ".":
+            # Float literal: contains digit(s), a dot, or e/E exponent (decimal only),
+            # or f/F suffix (not on hex numbers)
+            hasDigit = any(c.isdigit() for c in t)
+            isHex = t.startswith("0x") or t.startswith("0X")
+            isFloat = hasDigit and not isHex and (
+                any(c in t for c in ".eE") or
+                t.endswith("f") or t.endswith("F"))
+            if isFloat:
+                if t.startswith("0x") or t.startswith("0X"):
+                    fail("hex floats not yet supported", line)
+                # Parse decimal float
+                s = t.rstrip("fF")
+                fval = float(s)
+                ival = floatToBinary32(fval)
+                tokens.append(Token("FLOAT", t, line, ival))
+            else:
+                number = t.rstrip("uUlL")
+                if number.lower().startswith("0x"):
+                    value = int(number, 16)
+                elif number.startswith("0") and len(number) > 1:
+                    value = int(number, 8)
+                else:
+                    value = int(number)
+                tokens.append(Token("CONSTANT", t, line, value))
+        elif t[0].isalpha() or t[0] == "_":
+            tokens.append(Token(t if t in keywords else "IDENTIFIER", t, line))
         else:
             fail("unknown token: " + t, line)
     return tokens
@@ -255,7 +283,18 @@ class Preprocessor:
                 self.directive(stripped[1:].strip(), number, condStack,
                                active, fileName)
             elif active and stripped:
-                self.output.extend(self.expand(lexLine(line, number)))
+                tokens = lexLine(line, number)
+                # Replace __FILE__ and __LINE__ predefined macros
+                for j, tok in enumerate(tokens):
+                    if tok.type == "IDENTIFIER":
+                        if tok.name == "__LINE__":
+                            tokens[j] = Token("CONSTANT", str(number),
+                                              number, number)
+                        elif tok.name == "__FILE__":
+                            tokens[j] = Token("STRING", None,
+                                              number, 0)
+                            tokens[j].value = fileName
+                self.output.extend(self.expand(tokens))
 
         if condStack:
             fail("unterminated #if/#ifdef", lines[-1][0] if lines else None)
@@ -412,6 +451,8 @@ class Preprocessor:
 class CType:
     kind = "?"
     size = 0
+    isConst = False
+    isVolatile = False
 
     def isInteger(self):
         return self.kind == "int"
@@ -429,18 +470,38 @@ class CType:
         return self.kind == "function"
 
     def isScalar(self):
-        return self.kind in ("int", "pointer")
+        return self.kind in ("int", "long", "float", "pointer")
 
 
 class IntType(CType):
     kind = "int"
     size = 1
 
-    def __init__(self, name="int"):
+    def __init__(self, name="int", isUnsigned=False):
         self.name = name
+        self.isUnsigned = isUnsigned
 
     def __str__(self):
         return self.name
+
+
+class LongType(CType):
+    kind = "long"
+    size = 2
+
+    def __init__(self, isUnsigned=False):
+        self.isUnsigned = isUnsigned
+
+    def __str__(self):
+        return ("unsigned " if self.isUnsigned else "") + "long"
+
+
+class FloatType(CType):
+    kind = "float"
+    size = 2
+
+    def __str__(self):
+        return "float"
 
 
 class VoidType(CType):
@@ -524,6 +585,8 @@ class FunctionType(CType):
 
 INT = IntType("int")
 CHAR = IntType("char")
+LONG = LongType()
+FLOAT = FloatType()
 VOID = VoidType()
 CHARPTR = PointerType(CHAR)
 
@@ -572,8 +635,8 @@ def evalConstInner(node):
             return int(value == 0)
         raise NotConstant()
     if isinstance(node, BinaryOperator):
-        left = evalConstInner(node.expressionLeft)
-        right = evalConstInner(node.expressionRight)
+        left = evalConstInner(node.expressionLeft) & 0xffff
+        right = evalConstInner(node.expressionRight) & 0xffff
         sleft = left - 0x10000 if left & 0x8000 else left
         sright = right - 0x10000 if right & 0x8000 else right
         op = node.operator
@@ -738,6 +801,73 @@ class Codegen:
                      "\n\tneg r0,r0"
                      "\n" + lf + ":"
                      "\n\tret")
+        if "__sdiv32" in self.neededHelpers:
+            l32a = createUniqueLabel(); l32a2 = createUniqueLabel()
+            l32b = createUniqueLabel(); l32c = createUniqueLabel()
+            code += ("\n__sdiv32:"            # er0=dividend, er1=divisor
+                     # Stack has: [..., div_lo, div_hi, ret_addr]
+                     # Pop ret_addr, then divisor
+                     "\n\tpop r5"             # ret addr → r5
+                     "\n\tpop r2"             # divisor hi → er1
+                     "\n\tpop r3"             # divisor lo → er1
+                     "\n\tpush r5"            # ret addr back on stack
+                     "\n\tin r4,#0"           # r4 = sign flag
+                     "\n\tmov r5,r0"          # check dividend sign (hi word)
+                     "\n\tandi r5,#32768"
+                     "\n\tcmp r5,#0"
+                     "\n\tjeq " + l32a +
+                     "\n\tneg32 er0,er0"      # make dividend positive
+                     "\n\tin r4,#1"
+                     "\n\tjmp " + l32a2 +
+                     "\n" + l32a + ":"
+                     "\n\tin r4,#0"
+                     "\n" + l32a2 + ":"
+                     "\n\tmov r5,r2"          # check divisor sign
+                     "\n\tandi r5,#32768"
+                     "\n\tcmp r5,#0"
+                     "\n\tjeq " + l32b +
+                     "\n\tneg32 er1,er1"      # make divisor positive
+                     "\n\txori r4,#1"         # toggle sign flag
+                     "\n" + l32b + ":"
+                     "\n\tdiv32 er0,er1"      # unsigned division
+                     "\n\tcmp r4,#0"
+                     "\n\tjeq " + l32c +
+                     "\n\tneg32 er0,er0"      # apply sign
+                     "\n" + l32c + ":"
+                     "\n\tpop r5"             # ret addr
+                     "\n\tjmpr r5")
+        if "__smod32" in self.neededHelpers:
+            l32d = createUniqueLabel(); l32d2 = createUniqueLabel()
+            l32e = createUniqueLabel(); l32f = createUniqueLabel()
+            code += ("\n__smod32:"            # er0=dividend, er1=divisor
+                     "\n\tpop r5"             # ret addr → r5
+                     "\n\tpop r2"             # divisor hi → er1
+                     "\n\tpop r3"             # divisor lo → er1
+                     "\n\tpush r5"            # ret addr back on stack
+                     "\n\tin r4,#0"           # r4 = sign flag
+                     "\n\tmov r5,r0"          # check dividend sign
+                     "\n\tandi r5,#32768"
+                     "\n\tcmp r5,#0"
+                     "\n\tjeq " + l32d +
+                     "\n\tneg32 er0,er0"      # make dividend positive
+                     "\n\tin r4,#1"
+                     "\n\tjmp " + l32d2 +
+                     "\n" + l32d + ":"
+                     "\n\tin r4,#0"
+                     "\n" + l32d2 + ":"
+                     "\n\tmov r5,r2"          # check divisor sign
+                     "\n\tandi r5,#32768"
+                     "\n\tcmp r5,#0"
+                     "\n\tjeq " + l32e +
+                     "\n\tneg32 er1,er1"      # make divisor positive
+                     "\n" + l32e + ":"
+                     "\n\tmod32 er0,er1"      # unsigned mod
+                     "\n\tcmp r4,#0"
+                     "\n\tjeq " + l32f +
+                     "\n\tneg32 er0,er0"      # apply sign
+                     "\n" + l32f + ":"
+                     "\n\tpop r5"             # ret addr
+                     "\n\tjmpr r5")
         return code
 
     def internString(self, text):
@@ -769,11 +899,35 @@ def createUniqueLabel():
 createUniqueLabel.counter = 0
 
 
+def emitLongConstant(value):
+    """Load a 32-bit value into r0 (hi) : r1 (lo)."""
+    hi = (value >> 16) & 0xffff
+    lo = value & 0xffff
+    return "\n\tin r0,#" + str(hi) + "\n\tin r1,#" + str(lo)
+
+
 def loadFromAddress(ctype):
     """value of an lvalue whose address is in r0"""
+    if is32Bit(ctype):
+        return "\n\tldr r1,*r0\n\tldo r0,*r0,#1"
     if ctype.isScalar():
         return "\n\tldr r0,*r0"
     return ""                       # arrays/structs: address is the value
+
+
+def isLong(ctype):
+    """Check if a type is a 32-bit long."""
+    return hasattr(ctype, 'kind') and ctype.kind == "long"
+
+
+def isFloat(ctype):
+    """Check if a type is a 32-bit float."""
+    return hasattr(ctype, 'kind') and ctype.kind == "float"
+
+
+def is32Bit(ctype):
+    """Check if a type is 32-bit (long or float)."""
+    return isLong(ctype) or isFloat(ctype)
 
 
 def genScaledIndex(indexCode, scale):
@@ -803,6 +957,19 @@ class Constant(Node):
     def generate(self, scope):
         self.ctype = INT
         return "\n\tin r0,#" + str(self.value & 0xffff)
+
+
+class FloatConstant(Node):
+    """IEEE-754 binary32 float literal. Stores the 32-bit bit pattern."""
+    def __init__(self, bits):
+        self.bits = bits & 0xffffffff    # 32-bit IEEE-754 bit pattern
+        self.ctype = FLOAT
+
+    def generate(self, scope):
+        self.ctype = FLOAT
+        hi = (self.bits >> 16) & 0xffff
+        lo = self.bits & 0xffff
+        return "\n\tin r0,#" + str(hi) + "\n\tin r1,#" + str(lo)
 
 
 class StringLiteral(Node):
@@ -838,6 +1005,12 @@ class VariableAccess(Node):
             self.ctype = PointerType(symbol.ctype)
             return "\n\tin r0,#" + symbol.name
         self.ctype = symbol.ctype
+        if is32Bit(symbol.ctype):
+            code = self.generateAddress(scope)
+            code += "\n\tmov r2,r0"              # save address
+            code += "\n\tldr r0,*r2"             # hi word
+            code += "\n\tldo r1,*r2,#1"          # lo word
+            return code
         if symbol.ctype.isScalar():
             if symbol.kind == "global":
                 return "\n\tldd r0,*" + str(symbol.address)
@@ -961,14 +1134,39 @@ class FunctionCall(Node):
 
         code = ""
         totalWords = 0
-        for argument in reversed(self.arguments):
-            code += argument.generate(scope)
-            argType = argument.ctype
+        paramTypes = functionType.params if functionType.params is not None else []
+        for idx, argument in enumerate(reversed(self.arguments)):
+            # Use expected parameter type if available (for int→long promotion)
+            expectedType = None
+            if idx < len(paramTypes):
+                expectedType = paramTypes[len(paramTypes) - 1 - idx][1]
+            # Emit constant directly in 32-bit if expected type is long
+            longConstVal = None
+            if isLong(expectedType) and isinstance(argument, Constant):
+                longConstVal = argument.value
+            elif isLong(expectedType):
+                try:
+                    longConstVal = evalConstInner(argument)
+                except NotConstant:
+                    pass
+            if longConstVal is not None:
+                code += emitLongConstant(longConstVal)
+                argType = LONG
+            else:
+                code += argument.generate(scope)
+                argType = argument.ctype
             if argType.isStruct():
                 code += "\n\tmov r1,r0"
                 for i in reversed(range(argType.size)):
                     code += "\n\tldo r0,*r1,#" + str(i) + "\n\tpush r0"
                 totalWords += argType.size
+            elif is32Bit(argType) or is32Bit(expectedType):
+                # Promote int to long if needed
+                if not isLong(argType):
+                    code += "\n\tmov r1,r0\n\tin r0,#0"
+                # Push hi first, then lo → hi at r15+3, lo at r15+4
+                code += "\n\tpush r0\n\tpush r1"
+                totalWords += 2
             else:
                 code += "\n\tpush r0"
                 totalWords += 1
@@ -995,6 +1193,8 @@ class PostIncDec(Node):
     def generate(self, scope):
         code = self.operand.generateAddress(scope)
         self.ctype = self.operand.ctype
+        if self.ctype.isConst:
+            warn("modification of const-qualified variable", self.line)
         step = incDecStep(self.ctype, self.line)
         instruction = "addi" if self.operator == "++" else "subi"
         code += "\n\tmov r1,r0" \
@@ -1014,6 +1214,8 @@ class PreIncDec(Node):
     def generate(self, scope):
         code = self.operand.generateAddress(scope)
         self.ctype = self.operand.ctype
+        if self.ctype.isConst:
+            warn("modification of const-qualified variable", self.line)
         step = incDecStep(self.ctype, self.line)
         instruction = "addi" if self.operator == "++" else "subi"
         code += "\n\tmov r1,r0" \
@@ -1058,16 +1260,33 @@ class UnaryOperation(Node):
         code = self.operand.generate(scope)
         if not self.operand.ctype.isScalar():
             fail("invalid operand to unary " + self.operator, self.line)
-        self.ctype = INT
+        opLong = isLong(self.operand.ctype)
+        if opLong:
+            self.ctype = LONG
+        else:
+            self.ctype = INT
         if self.operator == "-":
-            code += "\n\tneg r0,r0"
+            if opLong:
+                code += "\n\tneg32 er0,er0"
+            else:
+                code += "\n\tneg r0,r0"
         elif self.operator == "~":
-            code += "\n\tnot r0,r0"
+            if opLong:
+                code += "\n\tnot32 er0,er0"
+            else:
+                code += "\n\tnot r0,r0"
         elif self.operator == "!":
-            code += "\n\tcmp r0,#0" \
-                  + "\n\tmov r0,state" \
-                  + "\n\tandi r0,#16" \
-                  + "\n\tshri r0,#4"
+            if opLong:
+                code += "\n\tor r2,r0,r1" \
+                      + "\n\tcmp r2,#0" \
+                      + "\n\tmov r0,state" \
+                      + "\n\tandi r0,#16" \
+                      + "\n\tshri r0,#4"
+            else:
+                code += "\n\tcmp r0,#0" \
+                      + "\n\tmov r0,state" \
+                      + "\n\tandi r0,#16" \
+                      + "\n\tshri r0,#4"
         elif self.operator == "+":
             self.ctype = self.operand.ctype
         return code
@@ -1113,6 +1332,19 @@ class Typecast(Node):
 
     def generate(self, scope):
         code = self.castExpression.generate(scope)
+        srcType = self.castExpression.ctype
+        dstType = self.typeName
+
+        # Same-size 32-bit types (long <-> float): just pass bits through
+        if is32Bit(srcType) and is32Bit(dstType):
+            pass  # bits are already in er0 (r0:r1)
+        # 32-bit → int: extract low word from r1
+        elif is32Bit(srcType) and not is32Bit(dstType):
+            code += "\n\tmov r0,r1"
+        # int → 32-bit: zero-extend r0 into r0:r1
+        elif not is32Bit(srcType) and is32Bit(dstType):
+            code += "\n\tmov r1,r0\n\tin r0,#0"
+
         self.ctype = self.typeName
         return code
 
@@ -1136,6 +1368,42 @@ class BinaryOperator(Node):
 
         if op in ("&&", "||"):
             return self.generateLogic(scope)
+
+        # constant folding: evaluate at compile time if possible.
+        # Skip operators where signed/unsigned matters or where the result
+        # may exceed 16 bits (shifts, division, comparison).
+        if op not in (",", "/", "%", "<", ">", "<=", ">=", ">>", "<<"):
+            try:
+                result = evalConstInner(self) & 0xffff
+                self.ctype = INT
+                return "\n\tin r0,#" + str(result)
+            except NotConstant:
+                pass
+
+        # Peek at operand types to detect 32-bit operations
+        def peekType(node):
+            t = node.ctype if hasattr(node, 'ctype') else None
+            # If the node is a Typecast to a 32-bit type, use that type
+            if isinstance(node, Typecast) and is32Bit(node.typeName):
+                return node.typeName
+            # Look through typecasts for VariableAccess
+            inner = node
+            while isinstance(inner, Typecast):
+                inner = inner.castExpression
+            if isinstance(inner, VariableAccess) and (t is None or not is32Bit(t)):
+                s = inner.resolve(scope)
+                if not isinstance(s, str) and s is not None:
+                    return s.ctype
+            # Detect chained 32-bit ops: (x >> 16) & 0xFFFF where >> produces long
+            if isinstance(node, BinaryOperator) and node.operator in ("<<", ">>"):
+                lt = peekType(node.expressionLeft)
+                if is32Bit(lt):
+                    return LONG
+            return t
+        leftPre = peekType(self.expressionLeft)
+        rightPre = peekType(self.expressionRight)
+        if is32Bit(leftPre) or is32Bit(rightPre):
+            return self.generate32(scope)
 
         code = self.expressionLeft.generate(scope)
         leftType = decay(self.expressionLeft.ctype)
@@ -1182,14 +1450,21 @@ class BinaryOperator(Node):
 
         code += rightCode + "\n\tpop r1"
 
+        unsignedDiv = (op in ("/", "%") and
+                       leftType.isInteger() and rightType.isInteger() and
+                       getattr(leftType, 'isUnsigned', False))
+
         if op in binaryOpInstructions:
             if op in ("/", "%"):
-                helper = "__sdiv" if op == "/" else "__smod"
-                cg.neededHelpers.add(helper)
-                code += "\n\tldpc r2" \
-                      + "\n\taddi r2,#4" \
-                      + "\n\tpush r2" \
-                      + "\n\tjmp " + helper
+                if unsignedDiv:
+                    code += "\n\t" + binaryOpInstructions[op] + " r0,r1,r0"
+                else:
+                    helper = "__sdiv" if op == "/" else "__smod"
+                    cg.neededHelpers.add(helper)
+                    code += "\n\tldpc r2" \
+                          + "\n\taddi r2,#4" \
+                          + "\n\tpush r2" \
+                          + "\n\tjmp " + helper
             else:
                 code += "\n\t" + binaryOpInstructions[op] + " r0,r1,r0"
             if op not in ("+", "-") and (leftType.isPointer() or rightType.isPointer()):
@@ -1197,12 +1472,21 @@ class BinaryOperator(Node):
             if leftType.isPointer():
                 self.ctype = leftType
         elif op in comparisonFlags:
+            unsignedCmp = (op in ("<", ">") and
+                           leftType.isInteger() and rightType.isInteger() and
+                           getattr(leftType, 'isUnsigned', False))
+            if unsignedCmp:
+                code += "\n\txori r0,#0x8000\n\txori r1,#0x8000"
             mask, shift = comparisonFlags[op]
             code += "\n\tcmp r1,r0" \
                   + "\n\tmov r0,state" \
                   + "\n\tandi r0,#" + str(mask) \
                   + "\n\tshri r0,#" + str(shift)
         elif op == "<=" or op == ">=":
+            unsignedCmp = (leftType.isInteger() and rightType.isInteger() and
+                           getattr(leftType, 'isUnsigned', False))
+            if unsignedCmp:
+                code += "\n\txori r0,#0x8000\n\txori r1,#0x8000"
             mask, shift = comparisonFlags["<" if op == "<=" else ">"]
             code += "\n\tcmp r1,r0" \
                   + "\n\tmov r0,state" \
@@ -1243,6 +1527,177 @@ class BinaryOperator(Node):
              + "\n" + labelSkip + ":" \
              + "\n\tin r0,#1" \
              + "\n" + labelEnd + ":"
+
+    # Float operation → C helper name
+    _floatHelpers = {"+": "f32_add", "-": "f32_sub", "*": "f32_mul", "/": "f32_div"}
+
+    def _generateFloatOp(self, scope, leftCode, leftType, rightCode, rightType):
+        """Generate float arithmetic/comparison using C runtime helpers.
+        C calling convention: push rightmost argument first."""
+        op = self.operator
+
+        # Generate left, save; generate right; rearrange so left is on top (pushed last)
+        code = leftCode
+        code += "\n\tpush r1\n\tpush r0"      # save left
+        code += rightCode
+        code += "\n\tpush r1\n\tpush r0"      # save right
+        code += "\n\tpop r2\n\tpop r3"        # right → er1
+        code += "\n\tpop r0\n\tpop r1"        # left → er0
+        code += "\n\tpush r3\n\tpush r2"      # push right first (lo, hi)
+        code += "\n\tpush r1\n\tpush r0"      # push left second (lo, hi) → left on top
+
+        if op in self._floatHelpers:
+            code += "\n\tcall " + self._floatHelpers[op]
+            code += "\n\tpop\n\tpop\n\tpop\n\tpop"
+            self.ctype = FLOAT
+            return code
+
+        # Comparison: call f32_cmp
+        code += "\n\tcall f32_cmp"
+        code += "\n\tpop\n\tpop\n\tpop\n\tpop"
+        if op == "==":
+            code += "\n\tcmp r0,#0\n\tmov r0,state\n\tandi r0,#16\n\tshri r0,#4"
+        elif op == "!=":
+            code += "\n\tcmp r0,#0\n\tmov r0,state\n\tandi r0,#32\n\tshri r0,#5"
+        elif op == "<":
+            code += "\n\tpush r0\n\tin r0,#-1\n\tpop r1\n\tcmp r1,r0\n\tmov r0,state\n\tandi r0,#16\n\tshri r0,#4"
+        elif op == ">":
+            code += "\n\tpush r0\n\tin r0,#0\n\tpop r1\n\tcmp r1,r0\n\tmov r0,state\n\tandi r0,#64\n\tshri r0,#6"
+        elif op == "<=":
+            code += "\n\tpush r0\n\tin r0,#1\n\tpop r1\n\tcmp r1,r0\n\tmov r0,state\n\tandi r0,#32\n\tshri r0,#5"
+        elif op == ">=":
+            code += "\n\tpush r0\n\tin r0,#-1\n\tpop r1\n\tcmp r1,r0\n\tmov r0,state\n\tandi r0,#32\n\tshri r0,#5"
+        self.ctype = INT
+        return code
+
+    # 32-bit long operation map
+    _longOp32 = {"+": "add32", "-": "sub32", "*": "lmul32",
+                 "/": "div32", "%": "mod32",
+                 "&": "and32", "|": "or32", "^": "xor32",
+                 "<<": "shl32", ">>": "shr32"}
+    _longCmpMask = {"==": (16, 4), "!=": (32, 5), "<": (4, 2), ">": (64, 6)}
+
+    def _genLongOperand(self, node, scope):
+        """Generate a 32-bit operand. For Constants, emit full 32-bit.
+        For other int nodes, promote to long."""
+        if isinstance(node, Constant):
+            return emitLongConstant(node.value), LONG
+        if isinstance(node, FloatConstant):
+            c = node.generate(scope)
+            return c, FLOAT
+        code = node.generate(scope)
+        ctype = node.ctype
+        if not is32Bit(ctype):
+            code += "\n\tmov r1,r0\n\tin r0,#0"
+        return code, ctype
+
+    def generate32(self, scope):
+        """Generate 32-bit code for long or float operands."""
+        op = self.operator
+        leftCode, leftType = self._genLongOperand(self.expressionLeft, scope)
+        rightCode, rightType = self._genLongOperand(self.expressionRight, scope)
+
+        floatOp = isFloat(leftType) or isFloat(rightType)
+        if floatOp:
+            return self._generateFloatOp(scope, leftCode, leftType, rightCode, rightType)
+
+        unsignedDiv = ((op == "/" or op == "%") and
+                       (getattr(leftType, 'isUnsigned', False) or
+                        getattr(rightType, 'isUnsigned', False)))
+
+        # Signed div/mod: dividend (left) in er0, divisor (right) in er1
+        if op in ("/", "%") and not unsignedDiv:
+            code = leftCode \
+                 + "\n\tpush r1" \
+                 + "\n\tpush r0"
+            code += rightCode      # divisor in er0
+            code += "\n\tmov r3,r1" \
+                  + "\n\tmov r2,r0"  # divisor → er1
+            code += "\n\tpop r0" \
+                  + "\n\tpop r1"     # dividend → er0
+            # Save divisor before trampoline destroys r2
+            helper = "__sdiv32" if op == "/" else "__smod32"
+            cg.neededHelpers.add(helper)
+            code += "\n\tpush r3" \
+                  + "\n\tpush r2" \
+                  + "\n\tldpc r2" \
+                  + "\n\taddi r2,#4" \
+                  + "\n\tpush r2" \
+                  + "\n\tjmp " + helper
+            self.ctype = LONG
+            return code
+
+        # For shifts (<<, >>): left is the value to shift, right is the count.
+        # shr32/shl32 do: er0 = er0 op er1.  So we want left in er0, right in er1.
+        if op in ("<<", ">>"):
+            code = leftCode \
+                 + "\n\tpush r1" \
+                 + "\n\tpush r0"
+            code += rightCode   # shift count in er0
+            code += "\n\tmov r3,r1" \
+                  + "\n\tmov r2,r0"  # shift count → er1
+            code += "\n\tpop r0" \
+                  + "\n\tpop r1"     # value → er0
+            code += "\n\t" + self._longOp32[op] + " er0,er1"
+            self.ctype = LONG
+            return code
+
+        # Standard: left in er1 (r2:r3), right in er0 (r0:r1)
+        code = leftCode \
+             + "\n\tpush r1" \
+             + "\n\tpush r0"
+        code += rightCode
+        code += "\n\tpop r2" \
+              + "\n\tpop r3"
+
+        # Unsigned div/mod: er1 / er0, result in er1, move to er0
+        if op in ("/", "%"):
+            code += "\n\t" + self._longOp32[op] + " er1,er0" \
+                  + "\n\tmov r0,r2" \
+                  + "\n\tmov r1,r3"
+            self.ctype = LONG
+            return code
+
+        # Subtraction: er1 - er0, result in er1, move to er0
+        if op == "-":
+            code += "\n\tsub32 er1,er0" \
+                  + "\n\tmov r0,r2" \
+                  + "\n\tmov r1,r3"
+            self.ctype = LONG
+            return code
+
+        op32 = self._longOp32.get(op)
+        if op32:
+            code += "\n\t" + op32 + " er0,er1"
+            self.ctype = LONG
+            return code
+
+        # Comparisons: cmp er1,er0 = cmp(left, right)
+        cmpInfo = self._longCmpMask.get(op)
+        if cmpInfo:
+            mask, shift = cmpInfo
+            code += "\n\tcmp32 er1,er0" \
+                  + "\n\tmov r0,state" \
+                  + "\n\tandi r0,#" + str(mask) \
+                  + "\n\tshri r0,#" + str(shift)
+            self.ctype = INT
+            return code
+
+        if op == "<=" or op == ">=":
+            baseOp = "<" if op == "<=" else ">"
+            mask, shift = self._longCmpMask[baseOp]
+            code += "\n\tcmp32 er1,er0" \
+                  + "\n\tmov r0,state" \
+                  + "\n\tmov r1,r0" \
+                  + "\n\tandi r0,#" + str(mask) \
+                  + "\n\tshri r0,#" + str(shift) \
+                  + "\n\tandi r1,#16" \
+                  + "\n\tshri r1,#4" \
+                  + "\n\tor r0,r1,r0"
+            self.ctype = INT
+            return code
+
+        fail("unsupported 32-bit operator " + op, self.line)
 
 
 class ConditionalExpression(Node):
@@ -1285,6 +1740,9 @@ class Assignment(Node):
             targetType = self.target.ctype
             self.ctype = targetType
 
+            if targetType.isConst:
+                warn("assignment to const-qualified variable", self.line)
+
             if targetType.isStruct():
                 if not (valueType.isStruct() and valueType.size == targetType.size):
                     fail("incompatible types in struct assignment", self.line)
@@ -1301,6 +1759,20 @@ class Assignment(Node):
 
             if targetType.isArray():
                 fail("cannot assign to an array", self.line)
+            if is32Bit(targetType):
+                # 32-bit assignment: value is in r0:r1, store both words
+                if not is32Bit(valueType):
+                    # promote int to 32-bit: hi=0, lo=r0
+                    valueCode += "\n\tmov r1,r0\n\tin r0,#0"
+                return valueCode \
+                     + "\n\tpush r0" \
+                     + "\n\tpush r1" \
+                     + addressCode \
+                     + "\n\tmov r2,r0" \
+                     + "\n\tpop r1" \
+                     + "\n\tpop r0" \
+                     + "\n\tstor *r2,r0" \
+                     + "\n\tstoo *r2,#1,r1"
             return valueCode \
                  + "\n\tpush r0" \
                  + addressCode \
@@ -1313,6 +1785,8 @@ class Assignment(Node):
         addressCode = self.target.generateAddress(scope)
         targetType = self.target.ctype
         self.ctype = targetType
+        if targetType.isConst:
+            warn("assignment to const-qualified variable", self.line)
         if not targetType.isScalar():
             fail("invalid target for " + self.operator, self.line)
 
@@ -1613,16 +2087,31 @@ class Return(Node):
 
     def generate(self, scope):
         code = ""
+        returnsLong = isLong(cg.currentFunction.returnType)
         if self.expression is not None:
             code += self.expression.generate(scope)
-            if self.expression.ctype.isStruct():
+            exprType = self.expression.ctype
+            if exprType.isStruct():
                 fail("returning structs by value is not supported", self.line)
+            # Promote int to long if function returns long
+            if returnsLong and not isLong(exprType):
+                code += "\n\tmov r1,r0\n\tin r0,#0"
         elif cg.currentFunction.returnType.kind != "void":
             warn("return without value in non-void function '%s'"
                  % cg.currentFunction.name, self.line)
-        code += "\n\tmov sp,r15" \
-              + "\n\tpop r15" \
-              + "\n\tret"
+            if returnsLong:
+                code += "\n\tin r0,#0\n\tin r1,#0"
+        if returnsLong:
+            # 'ret' uses r1 (pop r1; jmpr r1), which destroys the lo word.
+            # Use r2 for the return address instead to preserve er0 (r0:r1).
+            code += "\n\tmov sp,r15" \
+                  + "\n\tpop r15" \
+                  + "\n\tpop r2" \
+                  + "\n\tjmpr r2"
+        else:
+            code += "\n\tmov sp,r15" \
+                  + "\n\tpop r15" \
+                  + "\n\tret"
         return code
 
 
@@ -1742,6 +2231,26 @@ class Declaration(Node):
                 for i in range(ctype.size):
                     code += "\n\tldo r0,*r1,#" + str(i) \
                           + "\n\tstoo *r15,#" + str((offset + i) & 0xffff) + ",r0"
+            elif is32Bit(ctype) and isinstance(initializer, (Constant, FloatConstant)):
+                if isinstance(initializer, FloatConstant):
+                    code += initializer.generate(scope)
+                else:
+                    code += emitLongConstant(initializer.value)
+                code += "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0" \
+                      + "\n\tstoo *r15,#" + str((offset + 1) & 0xffff) + ",r1"
+            elif is32Bit(ctype):
+                # Try constant folding for unary-minus etc.
+                try:
+                    val = evalConstInner(initializer)
+                    code += emitLongConstant(val) \
+                          + "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0" \
+                          + "\n\tstoo *r15,#" + str((offset + 1) & 0xffff) + ",r1"
+                except NotConstant:
+                    # Non-constant — promote int to 32-bit
+                    code += initializer.generate(scope) \
+                          + "\n\tmov r1,r0\n\tin r0,#0" \
+                          + "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0" \
+                          + "\n\tstoo *r15,#" + str((offset + 1) & 0xffff) + ",r1"
             else:
                 code += initializer.generate(scope) \
                       + "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0"
@@ -1871,10 +2380,21 @@ class FunctionDefinition(Node):
                       + "\n\tsubi r0,#" + str(frameSize) \
                       + "\n\tstosp r0"
             code += body
-            code += "\n\tin r0,#0" \
-                  + "\n\tmov sp,r15" \
-                  + "\n\tpop r15" \
-                  + "\n\tret"
+            # If the body already ends with a return, skip the default epilogue
+            stmts = self.compoundStatement.statementList
+            endsWithReturn = stmts and isinstance(stmts[-1], Return)
+            if not endsWithReturn:
+                if isLong(self.functionType.returnType):
+                    code += "\n\tin r0,#0\n\tin r1,#0" \
+                          + "\n\tmov sp,r15" \
+                          + "\n\tpop r15" \
+                          + "\n\tpop r2" \
+                          + "\n\tjmpr r2"
+                else:
+                    code += "\n\tin r0,#0" \
+                          + "\n\tmov sp,r15" \
+                          + "\n\tpop r15" \
+                          + "\n\tret"
 
         cg.currentFunction = None
         return code
@@ -2062,6 +2582,7 @@ class Parser:
         storageClass = None
         baseType = None
         intParts = []
+        qualifiers = []
         self.nakedFlag = False
         line = self.line()
         while True:
@@ -2077,13 +2598,17 @@ class Parser:
                 storageClass = token.type
                 self.next()
             elif token.type in qualifierTokens:
+                qualifiers.append(token.type)
                 self.next()
             elif token.type in ("struct", "union"):
                 baseType = self.parseStructSpecifier()
             elif token.type == "enum":
                 baseType = self.parseEnumSpecifier()
-            elif token.type in ("float", "double"):
-                fail("floating point is not supported by the RISKY CPU", token.line)
+            elif token.type == "float":
+                baseType = FLOAT
+                self.next()
+            elif token.type == "double":
+                fail("double precision floating point is not yet supported", token.line)
             elif token.type in ("void", "char", "short", "int", "long",
                                 "signed", "unsigned"):
                 intParts.append(token.type)
@@ -2100,11 +2625,16 @@ class Parser:
                 fail("expected a type specifier", line)
             if "void" in intParts:
                 baseType = VOID
+            elif "long" in intParts:
+                baseType = LongType(isUnsigned=("unsigned" in intParts))
             else:
-                if "long" in intParts:
-                    warn("'long' is only 16 bit on this machine", line)
-                name = " ".join(intParts)
-                baseType = IntType(name)
+                name = " ".join(intParts) if intParts else "int"
+                baseType = IntType(name, isUnsigned=("unsigned" in intParts))
+        # Apply qualifiers
+        if baseType is not None and "const" in qualifiers:
+            baseType.isConst = True
+        if baseType is not None and "volatile" in qualifiers:
+            baseType.isVolatile = True
         return storageClass, baseType
 
     def parseStructSpecifier(self):
@@ -2300,6 +2830,8 @@ class Parser:
             node = VariableAccess(token.name)
         elif token.type == "CONSTANT":
             node = Constant(token.value)
+        elif token.type == "FLOAT":
+            node = FloatConstant(token.value)
         elif token.type == "STRING":
             text = token.value
             while self.peek() is not None and self.peek().type == "STRING":
@@ -2651,6 +3183,29 @@ def dumpAst(node, indent=0):
 
 ############################### DRIVER ###############################
 
+def peephole(asm):
+    """Simple peephole optimizations on generated assembly text."""
+    lines = asm.split("\n")
+    # Pattern 1: push r0 / pop r0 (nothing useful between) → remove both
+    # Pattern 2: push r0 / ...(no r0/r1 use)... / pop r1 → mov r1,r0
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # push r0 followed by pop r0 with no instructions between
+        if "\tpush r0" in line and i + 1 < len(lines) and "\tpop r0" in lines[i + 1]:
+            i += 2
+            continue
+        # push r0 followed by pop r1 with no instructions between → mov r1,r0
+        if "\tpush r0" in line and i + 1 < len(lines) and "\tpop r1" in lines[i + 1]:
+            result.append("\tmov r1,r0")
+            i += 2
+            continue
+        result.append(line)
+        i += 1
+    return "\n".join(result)
+
+
 def compile(inputFileName, includeDirs, showAst=False, keepDead=False):
     global cg, currentSourceName
     cg = Codegen()
@@ -2671,6 +3226,7 @@ def compile(inputFileName, includeDirs, showAst=False, keepDead=False):
     code = program.generate()
     if not keepDead:
         code = eliminateDeadFunctions(code, program.functionChunks)
+    code = peephole(code)
     return code + "\n"
 
 

@@ -1,0 +1,13 @@
+# Build artifacts
+*.asm
+*.hex
+compiler/__pycache__/
+*.pyc
+compiler/tests/_*.asm
+compiler/tests/_*.hex
+
+# OS
+os/kernel.asm
+os/kernel.hex
+os/demos/*.asm
+os/demos/*.hex

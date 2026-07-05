@@ -16,6 +16,10 @@ be tested without clicking through Logisim.  The machine model follows
       page  0xa:      terminal; a write to address 0x0 prints chr(value),
                       writes elsewhere are dropped, reads return 0
       page  0xb:      read only data ROM (preloadable input buffer)
+      page  0xc:      keyboard input; reading any address returns the next
+                      buffered key (0 if empty) and removes it from the
+                      buffer. The jkb/jkbr instructions jump when data
+                      is available.
   - push stores at sp, then decrements; pop increments, then loads
   - cmp/cmpi/cmp32 set the lt/eq/neq/gt flags (signed compare); ALU ops
     set zero/sign/carry
@@ -44,7 +48,7 @@ class Halt(Exception):
 
 
 class Simulator:
-    def __init__(self, program, inputData=""):
+    def __init__(self, program, inputData="", keyData=""):
         self.program = program           # list of 32 bit instruction words
         self.regs = [0] * 16
         self.pc = 0
@@ -52,6 +56,7 @@ class Simulator:
         self.page = 0
         self.pages = {}                  # page number -> 64K word list
         self.inputData = [ord(c) for c in inputData]
+        self.keybuf = [ord(c) for c in keyData]   # keyboard input buffer
         self.output = []
         self.cycles = 0
         # flags
@@ -78,6 +83,8 @@ class Simulator:
             return                       # other addresses: no memory here
         if self.page == 0xb:
             return                       # data ROM is read only
+        if self.page == 0xc:
+            return                       # keyboard page is read only
         if self.page <= 0x9:
             self.dataPage(self.page)[address] = value & MASK16
 
@@ -88,6 +95,10 @@ class Simulator:
         if self.page == 0xb:             # data ROM
             if address < len(self.inputData):
                 return self.inputData[address] & MASK16
+            return 0
+        if self.page == 0xc:             # keyboard input
+            if len(self.keybuf) > 0:
+                return self.keybuf.pop(0) & MASK16
             return 0
         if self.page <= 0x9:
             return self.dataPage(self.page)[address]
@@ -209,7 +220,7 @@ class Simulator:
                  self.sign, not self.sign,
                  self.carry, not self.carry,
                  self.borrow, not self.borrow,
-                 False]                  # no keyboard in the circuit
+                 len(self.keybuf) > 0]    # jkb: keyboard data available
         return flags[cond]
 
     def step(self):
@@ -361,8 +372,8 @@ def loadHex(fileName):
     return program
 
 
-def runProgram(program, inputData="", maxCycles=10000000, trace=False):
-    sim = Simulator(program, inputData)
+def runProgram(program, inputData="", keyData="", maxCycles=10000000, trace=False):
+    sim = Simulator(program, inputData, keyData)
     reason = sim.run(maxCycles, trace)
     return sim, reason
 
@@ -374,6 +385,7 @@ def main():
     args = [a for a in args if a not in ("--trace", "-v")]
 
     inputData = ""
+    keyData = ""
     maxCycles = 10000000
     positional = []
     i = 0
@@ -381,6 +393,10 @@ def main():
         if args[i] == "-i":
             with open(args[i + 1]) as f:
                 inputData = f.read()
+            i += 2
+        elif args[i] == "-k":
+            with open(args[i + 1]) as f:
+                keyData = f.read()
             i += 2
         elif args[i] == "--max-cycles":
             maxCycles = int(args[i + 1])
@@ -390,11 +406,11 @@ def main():
             i += 1
 
     if len(positional) != 1:
-        print("usage: risky_sim.py prog.hex [-i inputfile] [--max-cycles N] [--trace] [-v]")
+        print("usage: risky_sim.py prog.hex [-i inputfile] [-k keyfile] [--max-cycles N] [--trace] [-v]")
         exit(1)
 
     program = loadHex(positional[0])
-    sim, reason = runProgram(program, inputData, maxCycles, trace)
+    sim, reason = runProgram(program, inputData, keyData, maxCycles, trace)
     sys.stdout.write("".join(sim.output))
     sys.stdout.flush()
 

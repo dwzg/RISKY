@@ -127,10 +127,11 @@ int recv_msg(int *msg)
 #define FD_PIPE_WR  3
 #define FD_TERM     4
 #define FD_ROM      5
+#define FD_KBD      6
 
 int fd_type[MAX_FD];
 int fd_ino[MAX_FD];        /* for FD_FILE: inode number */
-int fd_offset[MAX_FD];     /* for FD_FILE: current read/write offset */
+long fd_offset[MAX_FD];    /* for FD_FILE: current read/write offset */
 int fd_pipe[MAX_FD];       /* for FD_PIPE: pipe index */
 int fd_refs[MAX_FD];       /* reference count */
 
@@ -143,6 +144,8 @@ void fd_init(void)
     /* stdout, stderr (terminal) */
     fd_type[1] = FD_TERM; fd_refs[1] = 1;
     fd_type[2] = FD_TERM; fd_refs[2] = 1;
+    /* keyboard input */
+    fd_type[3] = FD_KBD; fd_refs[3] = 1;
 }
 
 int fd_alloc(void)
@@ -254,7 +257,7 @@ void pipe_close_write(int pi)
 
 /* inode (in page 0 RAM) */
 int  fs_type[FS_INODES];     /* 0=free 1=file 2=dir */
-int  fs_size[FS_INODES];
+long fs_size[FS_INODES];
 int  fs_blocks[FS_INODES][FS_DIRECT];  /* page:addr encoded */
 char fs_name[FS_INODES][FS_NAMELEN];
 
@@ -499,6 +502,13 @@ int sys_read(int fd, int *buf, int words)
         }
         return i;
     }
+    if (fd_type[fd] == FD_KBD) {
+        for (i = 0; i < words; i++) {
+            while (!kbhit()) yield();   /* block until key available */
+            buf[i] = getkey();
+        }
+        return i;
+    }
     if (fd_type[fd] == FD_TERM) return 0;  /* can't read from terminal */
     if (fd_type[fd] == FD_FILE) {
         i = fs_readi(fd_ino[fd], fd_offset[fd], buf, words);
@@ -541,9 +551,19 @@ void sh_readln(char *buf, int max)
     int c, i, tmp[1];
     i = 0;
     while (i < max - 1) {
-        if (sys_read(0, tmp, 1) <= 0) break;
+        /* block on keyboard input */
+        if (sys_read(3, tmp, 1) <= 0) break;
         c = tmp[0];
         if (c == '\n') break;
+        if (c == '\b' || c == 0x7f) {  /* backspace or delete */
+            if (i > 0) {
+                i--;
+                putchar('\b');          /* move cursor back */
+                putchar(' ');           /* erase character */
+                putchar('\b');          /* move cursor back again */
+            }
+            continue;
+        }
         buf[i++] = c;
         putchar(c);  /* echo */
     }
@@ -609,16 +629,23 @@ void shell_task(void)
             sh_cat(arg);
         } else if (scmp(cmd, "mkfile") == 0 || scmp(cmd, "mkdir") == 0) {
             /* Parse path: split into parent dir and name.
-             * e.g. "/logs/boot" → parent = fs_resolve("/logs"), name = "boot" */
+             * "/logs/boot" → parent = /logs, name = "boot"
+             * "/hello"     → parent = /,     name = "hello"
+             * "hello"      → parent = /,     name = "hello"  (no /, implicit root) */
             int parent, type, ino;
-            char *path, *name, *slash;
-            path = arg;
+            char *p, *name, *slash;
+            p = arg;
+            name = arg;
+            slash = arg;
             /* find last '/' */
-            name = path;
-            slash = path;
-            while (*path) { if (*path == '/') slash = path; path++; }
-            if (slash == name) { parent = 0; name++; }      /* "/name" */
-            else { *slash = 0; parent = fs_resolve(arg); *slash = '/'; name = slash + 1; }
+            while (*p) { if (*p == '/') slash = p; p++; }
+            if (*name == '/' && slash == name) {
+                parent = 0; name++;             /* "/name" */
+            } else if (*name == '/') {
+                *slash = 0; parent = fs_resolve(name); *slash = '/'; name = slash + 1;
+            } else {
+                parent = 0;                     /* "name" — implicit root */
+            }
             type = (cmd[0] == 'm' && cmd[2] == 'f') ? 1 : 2;  /* mkfile→1, mkdir→2 */
             ino = fs_ialloc(type, name);
             if (ino >= 0 && parent >= 0 && fs_type[parent] == 2) {

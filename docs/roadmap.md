@@ -63,37 +63,37 @@ Features discussed but not yet implemented. Roughly ordered by impact.
 ## Compiler improvements
 
 ### Language features
-- **`const`:** currently parsed but ignored. Could place variables in a
-  read-only section or at least warn on write attempts.
-- **`volatile`:** currently parsed but ignored. Relevant for
-  memory-mapped I/O (terminal, ROM).
+- **`const`:** ✅ warns on assignment to const-qualified variables.
+  No read-only section yet.
+- **`volatile`:** ✅ qualifier tracked through type system. No codegen
+  effect yet (relevant for memory-mapped I/O).
 - **`static` functions:** file-scope visibility. Currently all functions
   are global (dead-code elimination partially mitigates this).
 - **K&R-style function definitions:** `int foo(a, b) int a; char *b; { ... }`
-- **`continue` in `for` loops:** the current implementation of continue
-  in for loops may not correctly execute the post-expression before the
-  condition check.
-- **Wider integer types:** 32-bit `long` using register pairs (er0–er7).
-  Would need compiler support for double-word arithmetic codegen.
-- **`unsigned` arithmetic:** currently accepted but operations use signed
-  semantics. Need separate unsigned comparison and division codegen.
+- **`continue` in `for` loops:** ✅ verified correct — continue jumps to
+  the post-expression label before the condition re-check.
+- **Wider integer types:** ✅ 32-bit `long` using register pairs (er0–er7)
+  with full arithmetic, comparison, function params/returns.
+- **`unsigned` arithmetic:** ✅ unsigned comparison (XOR 0x8000 trick),
+  unsigned division/modulo, unsigned right shift.
+- **Single-precision float:** ✅ `float` type, literals, arithmetic
+  operators. Runtime library (`float32.h`) with IEEE-754 add/sub/mul/div.
+  Subnormal flushing, reduced-precision mul/div.
 
 ### Optimisation
-- **Peephole optimiser:** scan the generated asm for patterns like
-  `push r0; pop r1` → `mov r1,r0`, or redundant `stoo`/`ldo` pairs.
+- **Peephole optimiser:** ✅ basic pass removes `push r0; pop r0` and
+  `push r0; pop r1 → mov r1,r0` patterns.
 - **Register allocation:** currently r0 is the sole accumulator.
   Using r1–r3 for temporary values could reduce push/pop overhead.
-- **Constant folding in codegen:** the parser evaluates constant
-  expressions for array sizes and global initializers, but run-time
-  expressions like `2 + 3` still generate `in r0,#2; push r0; in r0,#3;
-  pop r1; add r0,r1,r0` instead of `in r0,#5`.
-- **Tail call optimisation:** if a `return` statement directly calls a
-  function, replace `call + ret` with `jmp`.
+- **Constant folding in codegen:** ✅ compile-time evaluation of constant
+  arithmetic, bitwise, and equality expressions.
+- **Tail call optimisation:** ✅ intra-function tail calls (same function
+  name, any arguments). Cross-function TCO disabled (ABI issue).
 
 ### Debugging
 - **Source-level debugging:** emit line number information as asm
   comments. The simulator could map PC → source line.
-- **`__FILE__` and `__LINE__` macros:** standard C predefined macros.
+- **`__FILE__` and `__LINE__` macros:** ✅ implemented in preprocessor.
 - **`#pragma message`:** print a diagnostic during preprocessing.
 - **`-Wall` mode:** enable warnings for implicit declarations, unused
   variables, type mismatches.
