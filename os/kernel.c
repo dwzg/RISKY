@@ -84,6 +84,7 @@ void __sched(void)
 }
 
 /* Block the current process for at least `ticks` scheduler activations. */
+__naked void yield(void);
 void proc_sleep(int ticks)
 {
     if (ticks <= 0) return;
@@ -671,6 +672,8 @@ void fs_dir_list(int dir_ino)
 
 /* ---- file deletion ---- */
 
+int fs_resolve(char *path);
+
 /* Remove a directory entry by setting its inode to -1. */
 int fs_dir_remove(int dir_ino, char *name)
 {
@@ -965,6 +968,7 @@ void sh_ps(void)
 
 void prio_demo_task(void);
 
+void sh_run_pipeline(char *line);
 void shell_task(void)
 {
     char line[64], cmd[32], arg[64];
