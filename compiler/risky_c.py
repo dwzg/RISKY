@@ -1008,6 +1008,43 @@ def genScaledIndex(indexCode, scale):
     return code
 
 
+def simpleVarSymbol(node, scope):
+    """Symbol for a plain local/param/global scalar variable reference,
+    or None if the expression is anything more complex.  Such variables
+    can be loaded/stored with a single ldo/ldd/stoo/stod instead of
+    materializing the address."""
+    if not isinstance(node, VariableAccess):
+        return None
+    symbol = scope.lookup(node.name)
+    if symbol is None:
+        return None
+    if symbol.kind not in ("local", "param", "global"):
+        return None
+    if not symbol.ctype.isScalar():
+        return None
+    return symbol
+
+
+def loadSimpleVar(symbol, reg):
+    """load a 16-bit simple variable into the given register"""
+    if symbol.kind == "global":
+        return "\n\tldd %s,*%d" % (reg, symbol.address)
+    return "\n\tldo %s,*r15,#%d" % (reg, symbol.offset & 0xffff)
+
+
+def storeSimpleVar(symbol, reg="r0"):
+    """store reg (r0:r1 for 32-bit types) into a simple variable"""
+    if is32Bit(symbol.ctype):
+        if symbol.kind == "global":
+            return "\n\tstod *%d,r0\n\tstod *%d,r1" \
+                   % (symbol.address, symbol.address + 1)
+        return "\n\tstoo *r15,#%d,r0\n\tstoo *r15,#%d,r1" \
+               % (symbol.offset & 0xffff, (symbol.offset + 1) & 0xffff)
+    if symbol.kind == "global":
+        return "\n\tstod *%d,%s" % (symbol.address, reg)
+    return "\n\tstoo *r15,#%d,%s" % (symbol.offset & 0xffff, reg)
+
+
 ############################### AST: EXPRESSIONS ###############################
 
 class Node:
@@ -1077,11 +1114,11 @@ class VariableAccess(Node):
             return "\n\tin r0,#" + symbol.name
         self.ctype = symbol.ctype
         if is32Bit(symbol.ctype):
-            code = self.generateAddress(scope)
-            code += "\n\tmov r2,r0"              # save address
-            code += "\n\tldr r0,*r2"             # hi word
-            code += "\n\tldo r1,*r2,#1"          # lo word
-            return code
+            if symbol.kind == "global":
+                return "\n\tldd r0,*" + str(symbol.address) \
+                     + "\n\tldd r1,*" + str(symbol.address + 1)
+            return "\n\tldo r0,*r15,#" + str(symbol.offset & 0xffff) \
+                 + "\n\tldo r1,*r15,#" + str((symbol.offset + 1) & 0xffff)
         if symbol.ctype.isScalar():
             if symbol.kind == "global":
                 return "\n\tldd r0,*" + str(symbol.address)
@@ -1258,8 +1295,14 @@ class FunctionCall(Node):
         else:
             code += calleeCode + "\n\tcallr r0"
 
-        for _ in range(totalWords):
-            code += "\n\tpop"
+        # drop the arguments; r2 is free (r0/r1 hold the return value)
+        if totalWords > 3:
+            code += "\n\tldsp r2" \
+                  + "\n\taddi r2,#" + str(totalWords) \
+                  + "\n\tstosp r2"
+        else:
+            for _ in range(totalWords):
+                code += "\n\tpop"
 
         self.ctype = functionType.returnType
         if self.ctype.isStruct():
@@ -1273,6 +1316,17 @@ class PostIncDec(Node):
         self.operator = operator    # '++' or '--'
 
     def generate(self, scope):
+        symbol = simpleVarSymbol(self.operand, scope)
+        if symbol is not None and not is32Bit(symbol.ctype):
+            self.ctype = symbol.ctype
+            if self.ctype.isConst:
+                warn("modification of const-qualified variable", self.line)
+            step = incDecStep(self.ctype, self.line)
+            instruction = "addi" if self.operator == "++" else "subi"
+            return loadSimpleVar(symbol, "r0") \
+                 + "\n\tmov r1,r0" \
+                 + "\n\t" + instruction + " r1,#" + str(step) \
+                 + storeSimpleVar(symbol, "r1")
         code = self.operand.generateAddress(scope)
         self.ctype = self.operand.ctype
         if self.ctype.isConst:
@@ -1294,6 +1348,16 @@ class PreIncDec(Node):
         self.operator = operator
 
     def generate(self, scope):
+        symbol = simpleVarSymbol(self.operand, scope)
+        if symbol is not None and not is32Bit(symbol.ctype):
+            self.ctype = symbol.ctype
+            if self.ctype.isConst:
+                warn("modification of const-qualified variable", self.line)
+            step = incDecStep(self.ctype, self.line)
+            instruction = "addi" if self.operator == "++" else "subi"
+            return loadSimpleVar(symbol, "r0") \
+                 + "\n\t" + instruction + " r0,#" + str(step) \
+                 + storeSimpleVar(symbol)
         code = self.operand.generateAddress(scope)
         self.ctype = self.operand.ctype
         if self.ctype.isConst:
@@ -1947,10 +2011,14 @@ class Assignment(Node):
 
             if targetType.isArray():
                 fail("cannot assign to an array", self.line)
+            valueCode = emitConversion(valueCode, valueType, targetType)
+            # plain variable target: store directly, no address juggling
+            symbol = simpleVarSymbol(self.target, scope)
+            if symbol is not None:
+                return valueCode + storeSimpleVar(symbol)
             if is32Bit(targetType):
                 # 32-bit assignment: value is in r0:r1, store both words
                 # (int→float converts, int→long zero-extends)
-                valueCode = emitConversion(valueCode, valueType, targetType)
                 return valueCode \
                      + "\n\tpush r0" \
                      + "\n\tpush r1" \
@@ -1962,7 +2030,6 @@ class Assignment(Node):
                      + "\n\tstoo *r2,#1,r1"
             # 16-bit target: convert a float value (f32_to_int) or take
             # the low word of a long
-            valueCode = emitConversion(valueCode, valueType, targetType)
             return valueCode \
                  + "\n\tpush r0" \
                  + addressCode \
@@ -2008,6 +2075,14 @@ class Assignment(Node):
         else:
             operation = "\n\t" + binaryOpInstructions[op] + " r0,r1,r0"
 
+        # plain variable target: value in r0, old value in r1, store back
+        symbol = simpleVarSymbol(self.target, scope)
+        if symbol is not None:
+            return valueCode \
+                 + loadSimpleVar(symbol, "r1") \
+                 + operation \
+                 + storeSimpleVar(symbol)
+
         return addressCode \
              + "\n\tpush r0" \
              + "\n\tldr r0,*r0" \
@@ -2049,6 +2124,19 @@ class InlineAssembler(Node):
         return self.assembler
 
 
+def generateDiscarded(expression, scope):
+    """Generate an expression whose value is not used.  A post-inc/dec
+    then doesn't need to preserve the old value, so emit it as the
+    cheaper pre-inc/dec."""
+    if isinstance(expression, PostIncDec):
+        pre = PreIncDec(expression.operand, expression.operator)
+        pre.line = expression.line
+        code = pre.generate(scope)
+        expression.ctype = pre.ctype
+        return code
+    return expression.generate(scope)
+
+
 class ExpressionStatement(Node):
     def __init__(self, expression):
         self.expression = expression
@@ -2056,7 +2144,7 @@ class ExpressionStatement(Node):
     def generate(self, scope):
         if self.expression is None:
             return ""
-        return self.expression.generate(scope)
+        return generateDiscarded(self.expression, scope)
 
 
 class CompoundStatement(Node):
@@ -2170,7 +2258,7 @@ class ForLoop(Node):
         code += self.statement.generate(scope) \
               + "\n" + labelContinue + ":"
         if self.postExpression is not None:
-            code += self.postExpression.generate(scope)
+            code += generateDiscarded(self.postExpression, scope)
         code += "\n\tjmp " + labelCondition \
               + "\n" + labelEnd + ":"
         ctx.breakLabels.pop()
@@ -2673,14 +2761,30 @@ class Program(Node):
                 + "\n\tmov page,r0" \
                 + "\n\tin r0,#0xffff" \
                 + "\n\tstosp r0"
+        # collect all data initializers, then group identical values so
+        # each distinct value is loaded into r0 only once (all writes go
+        # to distinct addresses, so reordering is safe)
+        initWrites = []             # (address, operand text)
         for address, value in cg.globalInits:
-            startup += self.initStore(address, value)
+            operand = self.initOperand(value)
+            if operand is not None:
+                initWrites.append((address, operand))
         for index, text in enumerate(cg.strings):
             address = cg.stringAddresses[index]
             for i, char in enumerate(text + "\0"):
                 if ord(char) != 0:
-                    startup += "\n\tin r0,#" + str(ord(char)) \
-                             + "\n\tstod *" + str(address + i) + ",r0"
+                    initWrites.append((address + i, str(ord(char))))
+        groups = {}
+        order = []
+        for address, operand in initWrites:
+            if operand not in groups:
+                groups[operand] = []
+                order.append(operand)
+            groups[operand].append(address)
+        for operand in order:
+            startup += "\n\tin r0,#" + operand
+            for address in groups[operand]:
+                startup += "\n\tstod *" + str(address) + ",r0"
         startup += "\n\tcall main" \
                  + "\n__halt:" \
                  + "\n\tjmp __halt"
@@ -2698,7 +2802,9 @@ class Program(Node):
         self.functionChunks = functionChunks
         return code
 
-    def initStore(self, address, value):
+    def initOperand(self, value):
+        """operand text for an 'in r0,#...' initializer load, or None
+        for zero values (RAM starts zeroed)"""
         if isinstance(value, tuple):
             if value[0] == "str":
                 number = cg.stringAddresses[value[1]]
@@ -2708,16 +2814,14 @@ class Program(Node):
                 if symbol is not None:
                     number = symbol.address
                 elif name in cg.functions:
-                    return "\n\tin r0,#" + name \
-                         + "\n\tstod *" + str(address) + ",r0"
+                    return name             # label operand
                 else:
                     fail("unknown symbol '%s' in global initializer" % name, value[2])
         else:
             number = value
         if number == 0:
-            return ""                           # RAM starts zeroed
-        return "\n\tin r0,#" + str(number) \
-             + "\n\tstod *" + str(address) + ",r0"
+            return None
+        return str(number)
 
 
 ############################### DEAD CODE ELIMINATION ###############################
@@ -3425,32 +3529,657 @@ def dumpAst(node, indent=0):
             dumpAst(value, indent + 2)
 
 
-############################### DRIVER ###############################
+############################### PEEPHOLE OPTIMIZER ###############################
+#
+# Works on the generated assembly text after code generation and dead
+# function elimination.  All rules are local rewrites on small windows
+# of instructions; windows never extend across labels, so code reached
+# by a jump is never mixed into a window.  Register liveness questions
+# ("is r1 still needed after this instruction?") are answered by a
+# conservative forward scan that follows direct jumps and gives up (=
+# assumes live) at anything it cannot see through.
+
+_TERNARY_OPS = {"add", "sub", "lmul", "hmul", "div", "mod", "shl", "shr",
+                "and", "or", "xor"}
+_IMM_ALU_OPS = {"addi", "subi", "lmuli", "hmuli", "divi", "modi", "shli",
+                "shri", "andi", "ori", "xori"}
+_OPS32 = {"add32", "sub32", "lmul32", "hmul32", "div32", "mod32",
+          "shl32", "shr32", "and32", "or32", "xor32"}
+_JUMP_OPS = {"jmp", "jmz", "jnz", "jlt", "jnlt", "jeq", "jneq", "jgt",
+             "jngt", "jms", "jns", "jmc", "jnc", "jmb", "jnb", "jkb"}
+_RJUMP_OPS = {j + "r" for j in _JUMP_OPS}
+_ER_PAIRS = {"er%d" % i: ("r%d" % (2 * i), "r%d" % (2 * i + 1))
+             for i in range(8)}
+
+
+def _operandRegs(operand):
+    """set of registers named by an operand ('F' = ALU/compare flags)"""
+    name = operand.lstrip("*#").lower()
+    if name in _ER_PAIRS:
+        return set(_ER_PAIRS[name])
+    if re.fullmatch(r"r1[0-5]|r[0-9]", name):
+        return {name}
+    if name in ("sp", "page", "pc"):
+        return {name}
+    if name == "state":
+        return {"F"}
+    return set()
+
+
+class AsmInstruction:
+    """One parsed line of generated assembly with its register effects."""
+
+    def __init__(self, text):
+        self.text = text
+        self.label = None           # label name if this line defines one
+        self.op = ""
+        self.args = []
+        self.reads = set()
+        self.writes = set()
+        self.flow = None            # None|'jump'|'branch'|'rjump'|'call'|'ret'
+        self.target = None          # label of a jump/branch
+        self.stack = False          # pushes, pops or rewrites sp
+        self.known = True           # False: treat as a full barrier
+
+        stripped = text.split(";")[0].strip()
+        if stripped == "":
+            return
+        if stripped.endswith(":") and " " not in stripped:
+            self.label = stripped[:-1]
+            return
+        parts = [p for p in re.split(r"[ \t]+|,\s*", stripped) if p]
+        self.op = parts[0].lower()
+        self.args = parts[1:]
+        try:
+            self._classify()
+        except IndexError:
+            self.known = False
+
+    def _classify(self):
+        op, A = self.op, self.args
+        if op == "nop":
+            pass
+        elif op == "in":
+            self.writes |= _operandRegs(A[0])
+        elif op == "mov":
+            dst, src = A[0].lower(), A[1].lower()
+            if dst in ("sp", "page"):
+                self.reads |= _operandRegs(A[1])
+                self.writes.add(dst)
+                self.stack = dst == "sp"
+            else:
+                self.reads |= _operandRegs(A[1])
+                self.writes |= _operandRegs(A[0])
+                if src == "sp":
+                    self.stack = True   # conservative: reads sp
+        elif op == "mov32":
+            self.reads |= _operandRegs(A[1])
+            self.writes |= _operandRegs(A[0])
+        elif op in _TERNARY_OPS:
+            if len(A) == 3:
+                self.reads |= _operandRegs(A[1]) | _operandRegs(A[2])
+                self.writes |= _operandRegs(A[0]) | {"F"}
+            else:                       # auto-immediate or er-pair form
+                self.reads |= _operandRegs(A[0]) | _operandRegs(A[1])
+                self.writes |= _operandRegs(A[0]) | {"F"}
+        elif op in _IMM_ALU_OPS:
+            self.reads |= _operandRegs(A[0])
+            self.writes |= _operandRegs(A[0]) | {"F"}
+        elif op in ("negi", "noti"):
+            self.writes |= _operandRegs(A[0]) | {"F"}
+        elif op in ("neg", "not"):
+            self.reads |= _operandRegs(A[1])
+            self.writes |= _operandRegs(A[0]) | {"F"}
+        elif op in _OPS32:
+            self.reads |= _operandRegs(A[0]) | _operandRegs(A[1])
+            self.writes |= _operandRegs(A[0]) | {"F"}
+        elif op in ("neg32", "not32"):
+            self.reads |= _operandRegs(A[1])
+            self.writes |= _operandRegs(A[0]) | {"F"}
+        elif op in ("cmp", "cmpi", "cmp32"):
+            for a in A:
+                self.reads |= _operandRegs(a)
+            self.writes.add("F")
+        elif op in ("ldr", "ldo"):
+            self.reads |= _operandRegs(A[1])
+            self.writes |= _operandRegs(A[0])
+        elif op == "ldd":
+            self.writes |= _operandRegs(A[0])
+        elif op == "stor":
+            self.reads |= _operandRegs(A[0]) | _operandRegs(A[1])
+        elif op == "stoo":
+            self.reads |= _operandRegs(A[0]) | _operandRegs(A[2])
+        elif op == "stod":
+            self.reads |= _operandRegs(A[1])
+        elif op == "stoi":
+            self.reads |= _operandRegs(A[0])
+        elif op in ("push", "pushi"):
+            if A:
+                self.reads |= _operandRegs(A[0])
+            self.stack = True
+        elif op in ("pop", "popi"):
+            if A:
+                self.writes |= _operandRegs(A[0])
+            self.stack = True
+        elif op == "ldpc":
+            self.writes |= _operandRegs(A[0])
+        elif op == "ldsp":
+            self.reads.add("sp")
+            self.writes |= _operandRegs(A[0])
+        elif op == "stosp":
+            self.reads |= _operandRegs(A[0])
+            self.writes.add("sp")
+            self.stack = True
+        elif op == "ldpage":
+            self.reads.add("page")
+            self.writes |= _operandRegs(A[0])
+        elif op == "stopage":
+            self.reads |= _operandRegs(A[0])
+            self.writes.add("page")
+        elif op == "ldstate":
+            self.reads.add("F")
+            self.writes |= _operandRegs(A[0])
+        elif op in _JUMP_OPS:
+            regs = _operandRegs(A[0])
+            if regs:                    # register operand: indirect jump
+                self.reads |= regs | {"F"}
+                self.flow = "rjump"
+            elif op == "jmp":
+                self.flow = "jump"
+                self.target = A[0].lstrip("*#")
+            else:
+                self.reads.add("F")
+                self.flow = "branch"
+                self.target = A[0].lstrip("*#")
+        elif op in _RJUMP_OPS:
+            self.reads |= _operandRegs(A[0]) | {"F"}
+            self.flow = "rjump"
+        elif op == "call":              # expands to ldpc r0/addi/push/jmp
+            self.writes |= {"r0", "F"}
+            self.stack = True
+            self.flow = "call"
+            self.target = A[0]
+        elif op == "callr":             # expands to mov r1/ldpc r0/push/jmpr
+            self.reads |= _operandRegs(A[0])
+            self.writes |= {"r0", "r1", "F"}
+            self.stack = True
+            self.flow = "call"
+        elif op == "ret":               # expands to pop r1/jmpr r1
+            self.writes.add("r1")
+            self.stack = True
+            self.flow = "ret"
+        else:
+            self.known = False
+
+
+def _immValue(operand):
+    """numeric value of an immediate operand, or None"""
+    text = operand.lstrip("*#")
+    try:
+        if text.lower().startswith("0x") or text.lower().startswith("-0x"):
+            return int(text, 16)
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _regsDeadFrom(instrs, labels, start, regs, depth=0, visited=None):
+    """True if, starting at instrs[start], every register in `regs` is
+    (on every path) overwritten before it is read.  Conservative: gives
+    up on anything it cannot follow."""
+    if depth > 6:
+        return False
+    if visited is None:
+        visited = set()
+    live = frozenset(regs)
+    i = start
+    steps = 0
+    while i < len(instrs):
+        key = (i, live)
+        if key in visited:
+            return True             # revisited state: no read on this loop
+        visited.add(key)
+        steps += 1
+        if steps > 1000:
+            return False
+        ins = instrs[i]
+        if ins.label is not None or ins.op in ("", "nop"):
+            i += 1
+            continue
+        if not ins.known:
+            return False
+        if ins.reads & live:
+            return False
+        live = live - frozenset(ins.writes)
+        if not live:
+            return True
+        if ins.flow is None:
+            i += 1
+            continue
+        if ins.flow == "jump":
+            if ins.target not in labels:
+                return False
+            i = labels[ins.target]
+            continue
+        if ins.flow == "branch":
+            if ins.target not in labels:
+                return False
+            if not _regsDeadFrom(instrs, labels, labels[ins.target], live,
+                                 depth + 1, visited):
+                return False
+            i += 1
+            continue
+        if ins.flow == "call" and ins.target is not None \
+                and ins.target in labels:
+            # scan into the callee's actual code; its 'ret' (which
+            # writes r1) ends the scan there, so anything still live
+            # at that point stays conservatively live
+            i = labels[ins.target]
+            continue
+        return False                # callr/ret/rjump: cannot see further
+    return False
+
+
+def _nextIdx(instrs, i):
+    """index of the next instruction line, or None at a label/barrier/end"""
+    j = i + 1
+    while j < len(instrs):
+        ins = instrs[j]
+        if ins.label is not None:
+            return None
+        if ins.op == "":
+            j += 1
+            continue
+        return j
+    return None
+
+
+def _window(instrs, i, count):
+    """indices of `count` consecutive instructions starting at i, not
+    crossing labels; None if unavailable"""
+    result = [i]
+    j = i
+    while len(result) < count:
+        j = _nextIdx(instrs, j)
+        if j is None:
+            return None
+        result.append(j)
+    return result
+
+
+def _isCallIdiomJump(instrs, i):
+    """True if instrs[i] is the jmp of a ldpc/addi/push/jmp call sequence
+    (the following instruction is a return address, not dead code)"""
+    seen = 0
+    j = i - 1
+    while j >= 0 and seen < 3:
+        ins = instrs[j]
+        if ins.label is not None:
+            return False
+        if ins.op != "":
+            if ins.op == "ldpc":
+                return True
+            seen += 1
+        j -= 1
+    return False
+
+
+def _rulePushPop(instrs, labels, i):
+    """push rA / <block not touching rB or the stack> / pop rB
+       →  mov rB,rA / <block>        (dropped entirely if rA == rB)"""
+    ins = instrs[i]
+    if ins.op != "push" or not ins.args:
+        return None
+    srcRegs = _operandRegs(ins.args[0])
+    if len(srcRegs) != 1:
+        return None
+    rA = next(iter(srcRegs))
+    if rA in ("sp", "page", "pc", "F"):
+        return None
+    block = []
+    j = i
+    while len(block) <= 8:
+        j = _nextIdx(instrs, j)
+        if j is None:
+            return None
+        b = instrs[j]
+        if b.op == "pop" and b.args:
+            dstRegs = _operandRegs(b.args[0])
+            if len(dstRegs) != 1:
+                return None
+            rB = next(iter(dstRegs))
+            if rB in ("sp", "page", "pc", "F"):
+                return None
+            if rA == rB:
+                for blk in block:
+                    if rA in blk.writes:
+                        return None
+                return ([blk.text for blk in block], j - i + 1)
+            for blk in block:
+                if rB in blk.reads or rB in blk.writes:
+                    return None
+            return (["\tmov %s,%s" % (rB, rA)] + [blk.text for blk in block],
+                    j - i + 1)
+        if (not b.known or b.flow is not None or b.stack or b.op == "ldpc"
+                or "sp" in b.reads or "sp" in b.writes or "page" in b.writes):
+            return None
+        block.append(b)
+    return None
+
+
+def _ruleStoreLoad(instrs, labels, i):
+    """a store immediately followed by a load of the same location:
+    the value is still in the source register"""
+    a = instrs[i]
+    j = _nextIdx(instrs, i)
+    if j is None:
+        return None
+    b = instrs[j]
+    match = None                    # (stored reg, loaded reg)
+    if a.op == "stoo" and b.op == "ldo" and len(a.args) == 3 \
+            and len(b.args) == 3 \
+            and a.args[0].lstrip("*").lower() == b.args[1].lstrip("*").lower() \
+            and _immValue(a.args[1]) is not None \
+            and (_immValue(a.args[1]) & 0xffff) == ((_immValue(b.args[2]) or 0) & 0xffff) \
+            and _immValue(b.args[2]) is not None:
+        match = (a.args[2].lower(), b.args[0].lower())
+    elif a.op == "stod" and b.op == "ldd" and len(a.args) == 2 \
+            and len(b.args) == 2 \
+            and _immValue(a.args[0]) is not None \
+            and (_immValue(a.args[0]) & 0xffff) == ((_immValue(b.args[1]) or 0) & 0xffff) \
+            and _immValue(b.args[1]) is not None:
+        match = (a.args[1].lower(), b.args[0].lower())
+    elif a.op == "stor" and b.op == "ldr" and len(a.args) == 2 \
+            and len(b.args) == 2 \
+            and a.args[0].lstrip("*").lower() == b.args[1].lstrip("*").lower():
+        match = (a.args[1].lower(), b.args[0].lower())
+    if match is None:
+        return None
+    stored, loaded = match
+    if len(_operandRegs(stored)) != 1 or len(_operandRegs(loaded)) != 1:
+        return None
+    if stored == loaded:
+        return ([a.text], j - i + 1)
+    return ([a.text, "\tmov %s,%s" % (loaded, stored)], j - i + 1)
+
+
+_FOLD_IMM = {
+    "addi": lambda a, b: a + b,
+    "subi": lambda a, b: a - b,
+    "lmuli": lambda a, b: a * b,
+    "andi": lambda a, b: a & b,
+    "ori": lambda a, b: a | b,
+    "xori": lambda a, b: a ^ b,
+    "shli": lambda a, b: a << (b & 0x1f),
+    "shri": lambda a, b: (a & 0xffff) >> (b & 0x1f),
+}
+
+
+def _ruleInFold(instrs, labels, i):
+    """in rX,#a / opi rX,#b  →  in rX,#(a op b)   (flags must be dead)"""
+    a = instrs[i]
+    if a.op != "in" or len(a.args) != 2:
+        return None
+    j = _nextIdx(instrs, i)
+    if j is None:
+        return None
+    b = instrs[j]
+    if b.op not in _FOLD_IMM or len(b.args) != 2:
+        return None
+    if a.args[0].lower() != b.args[0].lower():
+        return None
+    va, vb = _immValue(a.args[1]), _immValue(b.args[1])
+    if va is None or vb is None:
+        return None
+    if not _regsDeadFrom(instrs, labels, j + 1, {"F"}):
+        return None
+    folded = _FOLD_IMM[b.op](va & 0xffff, vb & 0xffff) & 0xffff
+    return (["\tin %s,#%d" % (a.args[0].lower(), folded)], j - i + 1)
+
+
+def _ruleImmOp(instrs, labels, i):
+    """mov r1,r0 / in r0,#imm / op r0,r1,r0  →  opi r0,#imm
+       mov r1,r0 / in r0,#imm / cmp r1,r0   →  cmp r0,#imm
+    (r1 must be dead afterwards)"""
+    w = _window(instrs, i, 3)
+    if w is None:
+        return None
+    m1, m2, m3 = (instrs[k] for k in w)
+    if m1.op != "mov" or [a.lower() for a in m1.args] != ["r1", "r0"]:
+        return None
+    if m2.op != "in" or len(m2.args) != 2 or m2.args[0].lower() != "r0":
+        return None
+    imm = m2.args[1]
+    consumed = w[2] - i + 1
+    if m3.op in _TERNARY_OPS and [a.lower() for a in m3.args] == ["r0", "r1", "r0"]:
+        if not _regsDeadFrom(instrs, labels, w[2] + 1, {"r1"}):
+            return None
+        return (["\t%si r0,%s" % (m3.op, imm)], consumed)
+    if m3.op == "cmp" and [a.lower() for a in m3.args] == ["r1", "r0"]:
+        if not _regsDeadFrom(instrs, labels, w[2] + 1, {"r1"}):
+            return None
+        return (["\tcmp r0,%s" % imm], consumed)
+    return None
+
+
+def _ruleOperandSwap(instrs, labels, i):
+    """mov r1,r0 / <X writing r0> / op r0,r1,r0  →  <X writing r1> / op r0,r0,r1
+    (r1 must be dead afterwards)"""
+    w = _window(instrs, i, 3)
+    if w is None:
+        return None
+    m1, m2, m3 = (instrs[k] for k in w)
+    if m1.op != "mov" or [a.lower() for a in m1.args] != ["r1", "r0"]:
+        return None
+    if m2.op not in ("in", "ldo", "ldd", "ldr", "mov") or not m2.args:
+        return None
+    if m2.args[0].lower() != "r0" or m2.writes != {"r0"}:
+        return None
+    if {"r0", "r1"} & m2.reads:
+        return None
+    rewritten = "\t%s r1,%s" % (m2.op, ",".join(m2.args[1:]))
+    consumed = w[2] - i + 1
+    if m3.op in _TERNARY_OPS and [a.lower() for a in m3.args] == ["r0", "r1", "r0"]:
+        if not _regsDeadFrom(instrs, labels, w[2] + 1, {"r1"}):
+            return None
+        return ([rewritten, "\t%s r0,r0,r1" % m3.op], consumed)
+    if m3.op == "cmp" and [a.lower() for a in m3.args] == ["r1", "r0"]:
+        if not _regsDeadFrom(instrs, labels, w[2] + 1, {"r1"}):
+            return None
+        return ([rewritten, "\tcmp r0,r1"], consumed)
+    return None
+
+
+# state register bit/shift → branch op when the boolean is (0 / not 0)
+_FUSE_SIMPLE = {(16, 4): ("jneq", "jeq"), (32, 5): ("jeq", "jneq"),
+                (4, 2): ("jnlt", "jlt"), (64, 6): ("jngt", "jgt")}
+_FUSE_ORED = {(4, 2): ("jgt", "jngt"), (64, 6): ("jlt", "jnlt")}
+
+
+def _matchArgs(ins, op, *args):
+    return ins.op == op and [a.lower() for a in ins.args] == list(args)
+
+
+def _ruleCmpFuse(instrs, labels, i):
+    """Fuse the 'extract flag bit into r0, compare with 0, branch'
+    idiom emitted for comparisons in conditions into a single
+    conditional branch on the original compare flags."""
+    if not _matchArgs(instrs[i], "mov", "r0", "state"):
+        return None
+
+    # <= / >= : the eq bit is OR-ed in via r1
+    w = _window(instrs, i, 9)
+    if w is not None:
+        m = [instrs[k] for k in w]
+        if (_matchArgs(m[1], "mov", "r1", "r0")
+                and m[2].op == "andi" and m[2].args[0].lower() == "r0"
+                and m[3].op == "shri" and m[3].args[0].lower() == "r0"
+                and _matchArgs(m[4], "andi", "r1", "#16")
+                and _matchArgs(m[5], "shri", "r1", "#4")
+                and _matchArgs(m[6], "or", "r0", "r1", "r0")
+                and _matchArgs(m[7], "cmp", "r0", "#0")
+                and m[8].op in ("jeq", "jneq") and m[8].flow == "branch"
+                and m[8].target in labels):
+            key = (_immValue(m[2].args[1]), _immValue(m[3].args[1]))
+            if key in _FUSE_ORED:
+                branch = _FUSE_ORED[key][0 if m[8].op == "jeq" else 1]
+                dead = {"r0", "r1", "F"}
+                if _regsDeadFrom(instrs, labels, w[8] + 1, dead) and \
+                        _regsDeadFrom(instrs, labels, labels[m[8].target], dead):
+                    return (["\t%s %s" % (branch, m[8].target)], w[8] - i + 1)
+
+    # ==, !=, <, > : single flag bit
+    w = _window(instrs, i, 5)
+    if w is None:
+        return None
+    m = [instrs[k] for k in w]
+    if not (m[1].op == "andi" and m[1].args[0].lower() == "r0"
+            and m[2].op == "shri" and m[2].args[0].lower() == "r0"
+            and _matchArgs(m[3], "cmp", "r0", "#0")
+            and m[4].op in ("jeq", "jneq") and m[4].flow == "branch"
+            and m[4].target in labels):
+        return None
+    key = (_immValue(m[1].args[1]), _immValue(m[2].args[1]))
+    if key not in _FUSE_SIMPLE:
+        return None
+    branch = _FUSE_SIMPLE[key][0 if m[4].op == "jeq" else 1]
+    dead = {"r0", "F"}
+    if not _regsDeadFrom(instrs, labels, w[4] + 1, dead):
+        return None
+    if not _regsDeadFrom(instrs, labels, labels[m[4].target], dead):
+        return None
+    return (["\t%s %s" % (branch, m[4].target)], w[4] - i + 1)
+
+
+def _firstOpFrom(instrs, start):
+    """index of the first instruction line at/after start, skipping
+    labels and blanks"""
+    j = start
+    while j < len(instrs):
+        if instrs[j].label is None and instrs[j].op != "":
+            return j
+        j += 1
+    return None
+
+
+def _ruleJumpThread(instrs, labels, i):
+    """a jump to an unconditional jmp goes straight to the final target"""
+    ins = instrs[i]
+    if ins.flow not in ("jump", "branch") or ins.target not in labels:
+        return None
+    k = _firstOpFrom(instrs, labels[ins.target])
+    if k is None or k == i:
+        return None
+    t = instrs[k]
+    if t.flow != "jump" or t.op != "jmp" or t.target == ins.target:
+        return None
+    if t.target not in labels:
+        return None
+    # don't create a jump-to-self (the simulator's halt idiom)
+    if _firstOpFrom(instrs, labels[t.target]) == i:
+        return None
+    return (["\t%s %s" % (ins.op, t.target)], 1)
+
+
+def _ruleJumpToNext(instrs, labels, i):
+    """a jump whose target label follows immediately does nothing"""
+    ins = instrs[i]
+    if ins.flow not in ("jump", "branch") or ins.target is None:
+        return None
+    if ins.op == "jmp" and _isCallIdiomJump(instrs, i):
+        return None
+    j = i + 1
+    while j < len(instrs):
+        b = instrs[j]
+        if b.label is not None:
+            if b.label == ins.target:
+                return ([], 1)
+            j += 1
+            continue
+        if b.op == "":
+            j += 1
+            continue
+        return None
+    return None
+
+
+def _ruleUnreachable(instrs, labels, i):
+    """instructions between an unconditional control transfer and the
+    next label can never execute"""
+    ins = instrs[i]
+    if ins.op == "jmp" and ins.flow == "jump":
+        if _isCallIdiomJump(instrs, i):
+            return None
+    elif ins.flow != "ret" and ins.op != "jmpr":
+        return None
+    j = i + 1
+    removed = 0
+    while j < len(instrs) and instrs[j].label is None:
+        if instrs[j].op != "":
+            removed += 1
+        j += 1
+    if removed == 0:
+        return None
+    return ([ins.text], j - i)
+
+
+_PEEPHOLE_RULES = (_rulePushPop, _ruleStoreLoad, _ruleInFold, _ruleImmOp,
+                   _ruleOperandSwap, _ruleCmpFuse, _ruleJumpThread,
+                   _ruleJumpToNext, _ruleUnreachable)
+
+
+def _peepholeSweep(lines):
+    instrs = [AsmInstruction(text) for text in lines]
+    labels = {}
+    for idx, ins in enumerate(instrs):
+        if ins.label is not None:
+            labels[ins.label] = idx
+    out = []
+    changed = False
+    i = 0
+    while i < len(instrs):
+        ins = instrs[i]
+        if ins.label is None and ins.op == "" and ins.text.strip() == "":
+            i += 1                  # drop blank lines
+            continue
+        if ins.op == "mov" and len(ins.args) == 2 \
+                and ins.args[0].lower() == ins.args[1].lower() \
+                and _operandRegs(ins.args[0]):
+            i += 1                  # mov rX,rX does nothing
+            changed = True
+            continue
+        replacement = None
+        if ins.label is None and ins.known:
+            for rule in _PEEPHOLE_RULES:
+                replacement = rule(instrs, labels, i)
+                if replacement is not None:
+                    break
+        if replacement is None:
+            out.append(ins.text)
+            i += 1
+        else:
+            newLines, consumed = replacement
+            out.extend(newLines)
+            i += consumed
+            changed = True
+    return out, changed
+
 
 def peephole(asm):
-    """Simple peephole optimizations on generated assembly text."""
+    """Iterate the peephole rules to a fixed point."""
     lines = asm.split("\n")
-    # Pattern 1: push r0 / pop r0 (nothing useful between) → remove both
-    # Pattern 2: push r0 / ...(no r0/r1 use)... / pop r1 → mov r1,r0
-    result = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # push r0 followed by pop r0 with no instructions between
-        if "\tpush r0" in line and i + 1 < len(lines) and "\tpop r0" in lines[i + 1]:
-            i += 2
-            continue
-        # push r0 followed by pop r1 with no instructions between → mov r1,r0
-        if "\tpush r0" in line and i + 1 < len(lines) and "\tpop r1" in lines[i + 1]:
-            result.append("\tmov r1,r0")
-            i += 2
-            continue
-        result.append(line)
-        i += 1
-    return "\n".join(result)
+    for _ in range(30):
+        lines, changed = _peepholeSweep(lines)
+        if not changed:
+            break
+    return "\n".join(lines)
 
 
-def compile(inputFileName, includeDirs, showAst=False, keepDead=False):
+############################### DRIVER ###############################
+
+
+def compile(inputFileName, includeDirs, showAst=False, keepDead=False,
+            optimize=True):
     global cg, currentSourceName
     cg = Codegen()
     enumConstants.clear()
@@ -3470,7 +4199,8 @@ def compile(inputFileName, includeDirs, showAst=False, keepDead=False):
     code = program.generate()
     if not keepDead:
         code = eliminateDeadFunctions(code, program.functionChunks)
-    code = peephole(code)
+    if optimize:
+        code = peephole(code)
     return code + "\n"
 
 
@@ -3478,7 +4208,8 @@ def main():
     args = sys.argv[1:]
     showAst = "--ast" in args
     keepDead = "--keep-dead" in args
-    args = [a for a in args if a not in ("--ast", "--keep-dead")]
+    optimize = "--no-opt" not in args
+    args = [a for a in args if a not in ("--ast", "--keep-dead", "--no-opt")]
 
     includeDirs = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")]
     outputFileName = None
@@ -3499,14 +4230,14 @@ def main():
             i += 1
 
     if len(positional) != 1:
-        print("usage: risky_c.py input.c [-o output.asm] [-I includedir] [--ast] [--keep-dead]")
+        print("usage: risky_c.py input.c [-o output.asm] [-I includedir] [--ast] [--keep-dead] [--no-opt]")
         sys.exit(1)
 
     inputFileName = positional[0]
     if outputFileName is None:
         outputFileName = os.path.splitext(inputFileName)[0] + ".asm"
 
-    code = compile(inputFileName, includeDirs, showAst, keepDead)
+    code = compile(inputFileName, includeDirs, showAst, keepDead, optimize)
 
     with open(outputFileName, "w") as f:
         f.write(code)

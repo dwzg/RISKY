@@ -54,6 +54,12 @@ ROM, exactly like the v1 toolchain produced.
   concatenated, escapes like `\n`/`\t` apply).
 * Unused functions are removed from the output (`--keep-dead` disables
   this).
+* A peephole optimizer cleans up the generated assembly (`--no-opt`
+  disables it): push/pop pairs become register moves, constant operands
+  use the immediate ALU forms, comparisons in conditions fuse into a
+  single conditional branch, jumps are threaded, and unreachable code
+  is dropped.  Typical programs run ~1.5-2x faster and are ~30%
+  smaller.
 
 ## Deviations from C89 (word addressed 16 bit machine)
 
