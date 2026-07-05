@@ -4,6 +4,14 @@
  *     bit 31    : sign   (hi word bit 15)
  *     bits 30-23: exponent, 8 bits, bias 127
  *     bits 22-0 : mantissa, 23 bits, implicit leading 1 for normals
+ *
+ * 'long' is the carrier type: every function takes and returns float
+ * bit patterns in longs, and the compiler passes 'float' values to
+ * these functions bit-for-bit (long <-> float never converts
+ * numerically; use f32_from_long / f32_to_long for that).
+ *
+ * Semantics: round toward zero (results are exact or within 1 ulp),
+ * denormals flush to zero, NaN is 0x7FC00000.
  */
 
 #ifndef _FLOAT32_H
@@ -27,35 +35,42 @@ long f32_neg(long x) {
     return f32_make((int)(t & 0xFFFF) ^ 0x8000, (int)(x & 0xFFFF));
 }
 
-/* ---- addition (all field extraction inlined) ---- */
+long f32_abs(long x)
+{
+    return x & 0x7FFFFFFF;
+}
+
+int f32_isnan(long x)
+{
+    int hi = (int)(x >> 16);
+    if (((hi >> 7) & 0xFF) != 255)
+        return 0;
+    return (hi & 0x7F) != 0 || (int)(x & 0xFFFF) != 0;
+}
+
+int f32_isinf(long x)
+{
+    int hi = (int)(x >> 16);
+    return (hi & 0x7FFF) == 0x7F80 && (int)(x & 0xFFFF) == 0;
+}
+
+/* ---- addition (25-bit mantissas: 24 bits plus one guard bit) ---- */
 
 long f32_add(long a, long b)
 {
-    long ra, rb, t;
-    int sa, sb, ea, eb, e, sign;
-    int mhi_a, mlo_a, mhi_b, mlo_b;
-    int whi, wlo, shift, tmp;
+    int ha, hb, sa, sb, ea, eb, e, sign, tmp;
+    long ma, mb, m, t;
 
-    /* extract fields from a */
-    t = a >> 16;
-    sa = (int)(t & 0x8000);
-    t = t & 0x7F80;
-    ea = (int)(t >> 7);
-    t = a >> 16;
-    mhi_a = (int)(t & 0x7F);
-    mlo_a = (int)(a & 0xFFFF);
-
-    /* extract fields from b */
-    t = b >> 16;
-    sb = (int)(t & 0x8000);
-    t = t & 0x7F80;
-    eb = (int)(t >> 7);
-    t = b >> 16;
-    mhi_b = (int)(t & 0x7F);
-    mlo_b = (int)(b & 0xFFFF);
+    ha = (int)(a >> 16);
+    hb = (int)(b >> 16);
+    sa = ha & 0x8000;
+    sb = hb & 0x8000;
+    ea = (ha >> 7) & 0xFF;
+    eb = (hb >> 7) & 0xFF;
 
     /* NaN check */
-    if ((ea == 255 && (mhi_a || mlo_a)) || (eb == 255 && (mhi_b || mlo_b)))
+    if ((ea == 255 && ((ha & 0x7F) || (int)(a & 0xFFFF))) ||
+        (eb == 255 && ((hb & 0x7F) || (int)(b & 0xFFFF))))
         return f32_make(0x7FC0, 0);
 
     /* infinity check */
@@ -66,205 +81,157 @@ long f32_add(long a, long b)
     if (ea == 255) return a;
     if (eb == 255) return b;
 
-    /* zero check */
-    if (ea == 0 && mhi_a == 0 && mlo_a == 0) {
-        if (eb == 0 && mhi_b == 0 && mlo_b == 0) {
-            if (sa && sb) return f32_make(0x8000, 0);
-            return f32_make(0, 0);
-        }
-        return b;
+    /* zero check (denormals flush to zero) */
+    if (ea == 0 && eb == 0) {
+        if (sa && sb) return f32_make(0x8000, 0);
+        return 0;
     }
-    if (eb == 0 && mhi_b == 0 && mlo_b == 0) return a;
     if (ea == 0) return b;
     if (eb == 0) return a;
 
-    /* restore implicit leading 1 */
-    mhi_a = mhi_a | 0x80;
-    mhi_b = mhi_b | 0x80;
+    /* mantissas with implicit 1 and one guard bit: [2^24, 2^25) */
+    ma = (((a & 0x7FFFFF) | 0x800000)) << 1;
+    mb = (((b & 0x7FFFFF) | 0x800000)) << 1;
 
     /* make a the larger magnitude */
-    if (ea < eb || (ea == eb && mhi_a < mhi_b) ||
-        (ea == eb && mhi_a == mhi_b && mlo_a < mlo_b)) {
-        tmp = sa; sa = sb; sb = tmp;
+    if (ea < eb || (ea == eb && ma < mb)) {
+        t = ma; ma = mb; mb = t;
         tmp = ea; ea = eb; eb = tmp;
-        tmp = mhi_a; mhi_a = mhi_b; mhi_b = tmp;
-        tmp = mlo_a; mlo_a = mlo_b; mlo_b = tmp;
+        tmp = sa; sa = sb; sb = tmp;
     }
-
-    /* align smaller operand */
-    shift = ea - eb;
-    if (shift > 26) { mhi_b = 0; mlo_b = 0; }
-    else {
-        while (shift > 0) {
-            mlo_b = (mlo_b >> 1) | ((mhi_b & 1) ? 0x8000 : 0);
-            mhi_b = mhi_b >> 1;
-            shift = shift - 1;
-        }
-    }
-
-    e = ea;
     sign = sa;
+    e = ea;
+
+    /* align smaller operand (truncate) */
+    tmp = ea - eb;
+    if (tmp > 25) mb = 0;
+    else mb = mb >> tmp;
+
     if (sa == sb) {
-        /* same sign: add */
-        wlo = mlo_a + mlo_b;
-        whi = mhi_a + mhi_b;
-        if (wlo >= 0x10000) { wlo = wlo - 0x10000; whi = whi + 1; }
-        if (whi & 0x100) {
-            wlo = (wlo >> 1) | ((whi & 1) ? 0x8000 : 0);
-            whi = whi >> 1;
+        m = ma + mb;                            /* < 2^26 */
+        if ((int)(m >> 16) & 0x200) {           /* carry into bit 25 */
+            m = m >> 1;
             e = e + 1;
         }
     } else {
-        /* different signs: subtract */
-        wlo = mlo_a - mlo_b;
-        whi = mhi_a - mhi_b;
-        if (wlo < 0) { wlo = wlo + 0x10000; whi = whi - 1; }
-        if (whi == 0 && wlo == 0) return f32_make(0, 0);
-        while ((whi & 0x80) == 0) {
-            whi = (whi << 1) & 0xff;
-            if (wlo & 0x8000) whi = whi | 1;
-            wlo = (wlo << 1) & 0xffff;
+        m = ma - mb;                            /* >= 0 */
+        if (m == 0) return 0;
+        while (((int)(m >> 16) & 0x100) == 0) { /* normalize to bit 24 */
+            m = m << 1;
             e = e - 1;
             if (e <= 0) return f32_make(sign, 0);
         }
     }
+    m = m >> 1;                                 /* drop the guard bit */
 
     if (e >= 255) return f32_make(sign | 0x7F80, 0);
     if (e <= 0) return f32_make(sign, 0);
-    return f32_make(sign | (e << 7) | (whi & 0x7F), wlo);
+    return f32_make(sign | (e << 7) | (int)((m >> 16) & 0x7F),
+                    (int)(m & 0xFFFF));
 }
 
 long f32_sub(long a, long b) { return f32_add(a, f32_neg(b)); }
 
-/* ---- multiply (14-bit mantissa, decent precision) ---- */
+/* ---- multiply (full 24x24-bit mantissa product via 12-bit limbs) ---- */
 
 long f32_mul(long a, long b)
 {
-    long ta, tb, prod;
-    int sa, sb, ea, eb, e, sign, mhi, mlo;
-    int ma14, mb14, phi, plo;
+    int ha, hb, ea, eb, e, sign;
+    int ah, al, bh, bl;
+    long ma, mb, p2, lowp, hi25, m;
 
-    ta = a >> 16; tb = b >> 16;
-    sa = (int)(ta & 0x8000); sb = (int)(tb & 0x8000);
-    ta = ta & 0x7F80; ea = (int)(ta >> 7);
-    tb = tb & 0x7F80; eb = (int)(tb >> 7);
-    ta = a >> 16; tb = b >> 16;
-    sign = sa ^ sb;
+    ha = (int)(a >> 16);
+    hb = (int)(b >> 16);
+    sign = (ha ^ hb) & 0x8000;
+    ea = (ha >> 7) & 0xFF;
+    eb = (hb >> 7) & 0xFF;
 
     /* NaN / inf / zero */
     if (ea == 255 || eb == 255) {
-        if ((ea == 255 && ((int)(ta & 0x7F) || (int)(a & 0xFFFF))) ||
-            (eb == 255 && ((int)(tb & 0x7F) || (int)(b & 0xFFFF))))
+        if ((ea == 255 && ((ha & 0x7F) || (int)(a & 0xFFFF))) ||
+            (eb == 255 && ((hb & 0x7F) || (int)(b & 0xFFFF))))
             return f32_make(0x7FC0, 0);
-        if ((ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0) ||
-            (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0))
-            return f32_make(0x7FC0, 0);
+        if ((ea == 0 && (ha & 0x7F) == 0 && (int)(a & 0xFFFF) == 0) ||
+            (eb == 0 && (hb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0))
+            return f32_make(0x7FC0, 0);         /* inf * 0 */
         return f32_make(sign | 0x7F80, 0);
     }
-    if ((ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0) ||
-        (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0))
-        return f32_make(sign, 0);
-    if (ea == 0 || eb == 0) return f32_make(sign, 0);
+    if (ea == 0 || eb == 0)
+        return f32_make(sign, 0);               /* zero (denormals flush) */
 
-    /* 14-bit mantissa multiply using long arithmetic */
-    ma14 = (((int)(ta & 0x7F) | 0x80) << 6) | (((int)(a & 0xFFFF) >> 10) & 0x3F);
-    mb14 = (((int)(tb & 0x7F) | 0x80) << 6) | (((int)(b & 0xFFFF) >> 10) & 0x3F);
+    ma = (a & 0x7FFFFF) | 0x800000;
+    mb = (b & 0x7FFFFF) | 0x800000;
+    ah = (int)(ma >> 12);
+    al = (int)(ma & 0xFFF);
+    bh = (int)(mb >> 12);
+    bl = (int)(mb & 0xFFF);
+
+    /* 48-bit product ma*mb = (ah*bh << 24) + ((ah*bl + al*bh) << 12)
+     * + al*bl, accumulated as hi25 = product >> 24 plus a 24-bit tail */
+    p2 = (long)ah * bl + (long)al * bh;
+    lowp = ((p2 & 0xFFF) << 12) + (long)al * bl;
+    hi25 = (long)ah * bh + (p2 >> 12) + (lowp >> 24);
+
     e = ea + eb - 127;
-    prod = (long)ma14 * (long)mb14;  /* 28-bit product */
-
-    /* Extract and normalize. Product has binary point after bit 27.
-     * Implicit 1 should be at bit 27. */
-    {
-        long t;
-        t = prod >> 16;
-        phi = (int)(t & 0xFFFF);
-        plo = (int)(prod & 0xFFFF);
-
-        /* Find the leading 1 position in the 28-bit phi:plo */
-        if (phi == 0 && plo == 0) return f32_make(sign, 0);
-
-        /* Normalize: shift so bit 27 (0x800 in phi) is set */
-        while (phi < 0x800 && e > 0) {
-            phi = (phi << 1) | ((plo >> 15) & 1);
-            plo = (plo << 1) & 0xFFFF;
-            e = e - 1;
-        }
-        /* If phi >= 0x1000, shift right */
-        while (phi >= 0x1000) {
-            plo = (plo >> 1) | ((phi & 1) ? 0x8000 : 0);
-            phi = phi >> 1;
-            e = e + 1;
-        }
-
-        /* Extract 23-bit mantissa from phi:plo (bits 26-4) */
-        mhi = ((phi & 0x7FF) >> 4) & 0x7F;
-        mlo = ((phi & 0xF) << 12) | ((plo >> 4) & 0xFFF);
+    if ((int)(hi25 >> 16) & 0x80) {
+        /* product in [2,4): mantissa is product >> 24 */
+        e = e + 1;
+        m = hi25;
+    } else {
+        m = (hi25 << 1) | ((lowp >> 23) & 1);
     }
 
     if (e >= 255) return f32_make(sign | 0x7F80, 0);
     if (e <= 0) return f32_make(sign, 0);
-    return f32_make(sign | (e << 7) | mhi, mlo);
+    return f32_make(sign | (e << 7) | (int)((m >> 16) & 0x7F),
+                    (int)(m & 0xFFFF));
 }
 
-/* ---- divide ---- */
+/* ---- divide (full 24-bit restoring division) ---- */
 
 long f32_div(long a, long b)
 {
-    long ta, tb;
-    int sa, sb, ea, eb, e, sign, mhi, mlo;
-    int num, den, q, rem, count;
+    int ha, hb, ea, eb, e, sign, i;
+    long num, den, rem, q;
 
-    ta = a >> 16; tb = b >> 16;
-    sa = (int)(ta & 0x8000); sb = (int)(tb & 0x8000);
-    ta = ta & 0x7F80; ea = (int)(ta >> 7);
-    tb = tb & 0x7F80; eb = (int)(tb >> 7);
-    ta = a >> 16; tb = b >> 16;
-    sign = sa ^ sb;
+    ha = (int)(a >> 16);
+    hb = (int)(b >> 16);
+    sign = (ha ^ hb) & 0x8000;
+    ea = (ha >> 7) & 0xFF;
+    eb = (hb >> 7) & 0xFF;
 
     if (ea == 255 || eb == 255) {
-        if ((ea == 255 && ((int)(ta & 0x7F) || (int)(a & 0xFFFF))) ||
-            (eb == 255 && ((int)(tb & 0x7F) || (int)(b & 0xFFFF))))
+        if ((ea == 255 && ((ha & 0x7F) || (int)(a & 0xFFFF))) ||
+            (eb == 255 && ((hb & 0x7F) || (int)(b & 0xFFFF))))
             return f32_make(0x7FC0, 0);
         if (ea == 255 && eb == 255) return f32_make(0x7FC0, 0);
         if (ea == 255) return f32_make(sign | 0x7F80, 0);
-        return f32_make(sign, 0);
+        return f32_make(sign, 0);               /* x / inf */
     }
-    if (eb == 0 && (int)(tb & 0x7F) == 0 && (int)(b & 0xFFFF) == 0) {
-        if (ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0)
-            return f32_make(0x7FC0, 0);
-        return f32_make(sign | 0x7F80, 0);
+    if (eb == 0) {
+        if (ea == 0) return f32_make(0x7FC0, 0); /* 0 / 0 */
+        return f32_make(sign | 0x7F80, 0);       /* x / 0 */
     }
-    if (ea == 0 && (int)(ta & 0x7F) == 0 && (int)(a & 0xFFFF) == 0)
-        return f32_make(sign, 0);
-    if (ea == 0 || eb == 0) return f32_make(sign, 0);
+    if (ea == 0) return f32_make(sign, 0);
 
+    num = (a & 0x7FFFFF) | 0x800000;
+    den = (b & 0x7FFFFF) | 0x800000;
     e = ea - eb + 127;
+    if (num < den) { num = num << 1; e = e - 1; }
 
-    /* 16-bit mantissa divide: num = 1.M (top 16 bits), den = 1.M (top 16 bits) */
-    num = (((int)(ta & 0x7F) | 0x80) << 8) | (((int)(a & 0xFFFF) >> 8) & 0xFF);
-    den = (((int)(tb & 0x7F) | 0x80) << 8) | (((int)(b & 0xFFFF) >> 8) & 0xFF);
-
-    /* Restoring division with 13 fractional bits */
-    rem = num; q = 0; count = 0;
-    while (count < 13) {
-        rem = rem << 1; q = q << 1;
+    /* num in [den, 2*den): 24 quotient bits, MSB always 1 */
+    q = 0;
+    rem = num;
+    for (i = 0; i < 24; i++) {
+        q = q << 1;
         if (rem >= den) { rem = rem - den; q = q | 1; }
-        count = count + 1;
-    }
-
-    /* Normalize quotient */
-    if (q & 0x1000) {
-        mhi = (q >> 5) & 0x7F;
-        mlo = (q << 11) & 0xFFFF;
-    } else {
-        e = e - 1;
-        mhi = (q >> 4) & 0x7F;
-        mlo = (q << 12) & 0xFFFF;
+        rem = rem << 1;
     }
 
     if (e >= 255) return f32_make(sign | 0x7F80, 0);
     if (e <= 0) return f32_make(sign, 0);
-    return f32_make(sign | (e << 7) | mhi, mlo);
+    return f32_make(sign | (e << 7) | (int)((q >> 16) & 0x7F),
+                    (int)(q & 0xFFFF));
 }
 
 /* ---- comparison ---- */
@@ -292,9 +259,82 @@ int f32_cmp(long a, long b)
     return 0;
 }
 
-/* ---- print raw hex ---- */
+/* ---- int/long conversions (truncate toward zero, saturate) ---- */
 
-void f32_print(long x)
+long f32_from_int(int i)
+{
+    int sign, e;
+    long m;
+    if (i == 0) return 0;
+    sign = 0;
+    if (i < 0) { sign = 0x8000; i = -i; }   /* -32768 wraps to 0x8000 */
+    m = (long)i & 0xFFFF;                   /* magnitude 1..32768 */
+    e = 127 + 23;
+    while (((int)(m >> 16) & 0x80) == 0) { m = m << 1; e = e - 1; }
+    return f32_make(sign | (e << 7) | (int)((m >> 16) & 0x7F),
+                    (int)(m & 0xFFFF));
+}
+
+long f32_from_long(long v)
+{
+    int sign, e, hi;
+    long m;
+    if (v == 0) return 0;
+    hi = (int)(v >> 16);
+    sign = 0;
+    if (hi & 0x8000) { sign = 0x8000; v = -v; }  /* LONG_MIN wraps to 2^31 */
+    m = v;
+    e = 127 + 23;
+    while ((int)(m >> 16) >> 8) { m = m >> 1; e = e + 1; }
+    while (((int)(m >> 16) & 0x80) == 0) { m = m << 1; e = e - 1; }
+    return f32_make(sign | (e << 7) | (int)((m >> 16) & 0x7F),
+                    (int)(m & 0xFFFF));
+}
+
+int f32_to_int(long x)
+{
+    int hi, sign, e, shift, v;
+    long m;
+    hi = (int)(x >> 16);
+    sign = hi & 0x8000;
+    e = (hi >> 7) & 0xFF;
+    if (e < 127) return 0;                  /* |x| < 1 (NaN would saturate) */
+    shift = e - 127;
+    if (e == 255 || shift >= 15) {
+        if (sign) return (int)0x8000;       /* -32768 */
+        return 32767;
+    }
+    m = (x & 0x7FFFFF) | 0x800000;
+    m = m >> (23 - shift);
+    v = (int)(m & 0xFFFF);
+    if (sign) return -v;
+    return v;
+}
+
+long f32_to_long(long x)
+{
+    int hi, sign, e, shift;
+    long m;
+    hi = (int)(x >> 16);
+    sign = hi & 0x8000;
+    e = (hi >> 7) & 0xFF;
+    if (e < 127) return 0;
+    shift = e - 127;
+    if (e == 255 || shift >= 31) {
+        if (sign) return f32_make(0x8000, 0);       /* -2147483648 */
+        return f32_make(0x7FFF, 0xFFFF);            /*  2147483647 */
+    }
+    m = (x & 0x7FFFFF) | 0x800000;
+    if (shift >= 23) m = m << (shift - 23);
+    else m = m >> (23 - shift);
+    if (sign) return -m;
+    return m;
+}
+
+/* ---- printing ---- */
+
+/* print raw bits as 0x......... */
+void f32_print_hex(long x)
 {
     int hi, lo;
     hi = (int)(x >> 16);
@@ -302,6 +342,42 @@ void f32_print(long x)
     print_string("0x");
     print_hex(hi);
     print_hex(lo);
+}
+
+/* print with sign, integer part and 6 fractional digits (binary32
+ * carries ~7 significant decimal digits).  Integer parts beyond the
+ * long range print saturated. */
+void f32_print(long x)
+{
+    int hi, e, digit, i;
+    long ip, frac;
+    hi = (int)(x >> 16);
+    e = (hi >> 7) & 0xFF;
+    if (e == 255) {
+        if ((hi & 0x7F) || (int)(x & 0xFFFF)) {
+            print_string("nan");
+            return;
+        }
+        if (hi & 0x8000) putchar('-');
+        print_string("inf");
+        return;
+    }
+    if (hi & 0x8000) {
+        putchar('-');
+        x = x & 0x7FFFFFFF;
+    }
+    ip = f32_to_long(x);
+    print_long(ip);
+    putchar('.');
+    frac = f32_sub(x, f32_from_long(ip));
+    for (i = 0; i < 6; i++) {
+        frac = f32_mul(frac, f32_from_int(10));
+        digit = f32_to_int(frac);
+        if (digit > 9) digit = 9;
+        if (digit < 0) digit = 0;
+        putchar('0' + digit);
+        frac = f32_sub(frac, f32_from_int(digit));
+    }
 }
 
 #endif
