@@ -698,6 +698,7 @@ char sh_seg_cmd[MAX_PROCS][16];
 char sh_seg_arg[MAX_PROCS][32];
 int  sh_seg_stdin[MAX_PROCS];    /* fd to dup2 to 0 */
 int  sh_seg_stdout[MAX_PROCS];   /* fd to dup2 to 1 */
+int  sh_seg_ino[MAX_PROCS];      /* pre-resolved inode for file paths */
 
 /* forward declarations */
 void sh_pipe_segment_task(void);
@@ -725,6 +726,20 @@ void sh_readln(char *buf, int max)
         putchar(c);  /* echo */
     }
     buf[i] = 0;
+}
+
+/* cat a file by inode (already resolved) — avoids calling fs_resolve
+ * at problematic call depths inside pipe segments. */
+static void sh_cat_inode(int ino)
+{
+    int fd, buf[32], n, i;
+    fd = fd_alloc();
+    if (fd < 0) { puts("open failed"); return; }
+    fd_type[fd] = FD_FILE; fd_ino[fd] = ino; fd_offset[fd] = 0;
+    while ((n = sys_read(fd, buf, 32)) > 0)
+        sys_write(1, buf, n);
+    sys_write(1, "\n", 1);
+    sys_close(fd);
 }
 
 void sh_cat(char *path)
@@ -799,9 +814,32 @@ void shell_task(void)
 }
 
 /* Execute a single builtin command (no pipes). */
+/* Execute the "write" command — has a large buffer, so it lives in its
+ * own function to keep sh_exec_cmd's stack frame small for pipe segments. */
+static int sh_write_cmd(char *arg)
+{
+    char *path, *text;
+    int fd, i, buf[128];
+    path = arg;
+    for (text = arg; *text && *text != ' '; text++);
+    if (*text) { *text = 0; text++; }
+    fd = sys_open(path);
+    if (fd >= 0) {
+        for (i = 0; text[i]; i++) buf[i] = text[i];
+        sys_write(fd, buf, i);
+        sys_close(fd);
+        printf("wrote %d bytes to %s\n", i, path);
+    } else {
+        puts("open failed");
+    }
+    return 0;
+}
+
+/* Execute a single builtin command (no pipes).
+ * Keep stack usage minimal — large buffers are in helper functions. */
 int sh_exec_cmd(char *cmd, char *arg)
 {
-    int i, fd, fds[2], pid, buf[128];
+    int fd, fds[2], pid;
 
     if (scmp(cmd, "help") == 0) {
         puts("help ps ls cat mkfile mkdir pipe write echo nice sleep prio exit");
@@ -811,7 +849,23 @@ int sh_exec_cmd(char *cmd, char *arg)
         if (arg[0]) { fs_dir_list(fs_resolve(arg)); putchar('\n'); }
         else { fs_dir_list(0); putchar('\n'); }
     } else if (scmp(cmd, "cat") == 0) {
-        sh_cat(arg);
+        if (arg[0]) {
+            int ino;
+            /* use pre-resolved inode if available (set by parent
+             * before spawning pipe children) */
+            ino = sh_seg_ino[cur_pid];
+            if (ino > 0 && fs_type[ino] == 1) {
+                sh_cat_inode(ino);
+            } else {
+                ino = fs_resolve(arg);
+                if (ino < 0 || fs_type[ino] != 1)
+                    puts("not found");
+                else
+                    sh_cat_inode(ino);
+            }
+        } else {
+            sh_cat(arg);   /* no path — read stdin */
+        }
     } else if (scmp(cmd, "mkfile") == 0 || scmp(cmd, "mkdir") == 0) {
         int parent, type, ino;
         char *p, *name, *slash;
@@ -833,26 +887,13 @@ int sh_exec_cmd(char *cmd, char *arg)
             puts("create failed");
         }
     } else if (scmp(cmd, "write") == 0) {
-        char *path, *text;
-        path = arg;
-        for (text = arg; *text && *text != ' '; text++);
-        if (*text) { *text = 0; text++; }
-        fd = sys_open(path);
-        if (fd >= 0) {
-            for (i = 0; text[i]; i++) buf[i] = text[i];
-            sys_write(fd, buf, i);
-            sys_close(fd);
-            printf("wrote %d bytes to %s\n", i, path);
-        } else {
-            puts("open failed");
-        }
+        sh_write_cmd(arg);
     } else if (scmp(cmd, "pipe") == 0) {
         if (sys_pipe(fds) == 0)
             printf("pipe: rd=%d wr=%d\n", fds[0], fds[1]);
         else
             puts("pipe failed");
     } else if (scmp(cmd, "echo") == 0) {
-        /* write to stdout (fd 1) so pipe redirection works */
         int elen;
         for (elen = 0; arg[elen]; elen++);
         sys_write(1, arg, elen);
@@ -957,6 +998,23 @@ void sh_run_pipeline(char *line)
     }
     if (nseg < 2) return;
 
+    /* ---- pre-resolve file paths (before pipe creation avoids a
+     *      compiler bug that makes fs_resolve fail later). ----
+     *      Temporarily store inodes in pids[]; they'll be moved to
+     *      sh_seg_ino[] after proc_spawn assigns real pids. */
+    for (i = 0; i < nseg; i++) {
+        char *s = segs[i]; char ta[32]; int ik;
+        pids[i] = 0;
+        while (*s == ' ' || *s == '\t') s++;
+        while (*s && *s != ' ' && *s != '\t') s++;   /* skip cmd */
+        while (*s == ' ' || *s == '\t') s++;          /* skip whitespace */
+        for (ik = 0; s[ik] && s[ik] != ' ' && s[ik] != '\t' && ik < 31; ik++)
+            ta[ik] = s[ik];
+        ta[ik] = 0;
+        if (ta[0] == '/')
+            pids[i] = fs_resolve(ta);
+    }
+
     /* ---- create pipes ---- */
     for (i = 0; i < nseg - 1; i++) {
         if (sys_pipe(pipes[i]) < 0) {
@@ -985,24 +1043,27 @@ void sh_run_pipeline(char *line)
             targ[k] = s[j + k];
         targ[k] = 0;
 
-        pid = proc_spawn(sh_pipe_segment_task, cur_pid, "pip");
-        pids[i] = pid;
-        if (pid >= 0) {
-            in  = (i > 0)       ? pipes[i-1][0] : 0;
-            out = (i < nseg-1)  ? pipes[i][1]   : 1;
-            /* copy into the child's per-pid slot */
-            for (k = 0; tcmd[k]; k++)
-                sh_seg_cmd[pid][k] = tcmd[k];
-            sh_seg_cmd[pid][k] = 0;
-            for (k = 0; targ[k]; k++)
-                sh_seg_arg[pid][k] = targ[k];
-            sh_seg_arg[pid][k] = 0;
-            sh_seg_stdin[pid]  = in;
-            sh_seg_stdout[pid] = out;
-            p_priority[pid] = 100 - i;  /* writer-before-reader order */
-        } else {
-            puts("spawn failed");
-            break;
+        {   int saved_ino = pids[i];   /* pre-resolved inode from above */
+            pid = proc_spawn(sh_pipe_segment_task, cur_pid, "pip");
+            pids[i] = pid;
+            if (pid >= 0) {
+                in  = (i > 0)       ? pipes[i-1][0] : 0;
+                out = (i < nseg-1)  ? pipes[i][1]   : 1;
+                sh_seg_ino[pid] = saved_ino;  /* transfer pre-resolved inode */
+                /* copy into the child's per-pid slot */
+                for (k = 0; tcmd[k]; k++)
+                    sh_seg_cmd[pid][k] = tcmd[k];
+                sh_seg_cmd[pid][k] = 0;
+                for (k = 0; targ[k]; k++)
+                    sh_seg_arg[pid][k] = targ[k];
+                sh_seg_arg[pid][k] = 0;
+                sh_seg_stdin[pid]  = in;
+                sh_seg_stdout[pid] = out;
+                p_priority[pid] = 100 - i;  /* writer-before-reader order */
+            } else {
+                puts("spawn failed");
+                break;
+            }
         }
     }
 
