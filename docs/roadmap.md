@@ -77,8 +77,13 @@ Features discussed but not yet implemented. Roughly ordered by impact.
 - **`unsigned` arithmetic:** ✅ unsigned comparison (XOR 0x8000 trick),
   unsigned division/modulo, unsigned right shift.
 - **Single-precision float:** ✅ `float` type, literals, arithmetic
-  operators. Runtime library (`float32.h`) with IEEE-754 add/sub/mul/div.
-  Subnormal flushing, reduced-precision mul/div.
+  operators, comparisons, int↔float conversions (casts, assignments,
+  arguments, returns, mixed arithmetic), compound assignment, unary
+  minus, truth tests. Runtime library (`float32.h`) with IEEE-754
+  binary32 add/sub/mul/div at full 24-bit mantissa precision (round
+  toward zero, ≤1 ulp; subnormals flush to zero), int/long conversions,
+  and decimal/hex printing. Validated against a host-side IEEE-754
+  reference on randomized vectors.
 
 ### Optimisation
 - **Peephole optimiser:** ✅ basic pass removes `push r0; pop r0` and

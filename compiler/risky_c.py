@@ -619,6 +619,33 @@ def evalConstSigned(node, context="constant expression"):
     return value - 0x10000 if value & 0x8000 else value
 
 
+def containsWideConstant(node):
+    """True if a constant expression involves values beyond 16 bits
+    (wide constants or casts to a 32-bit type), so folding it with
+    16-bit int semantics would corrupt it."""
+    if isinstance(node, Constant):
+        return node.value > 0xffff
+    if isinstance(node, FloatConstant):
+        return True
+    if isinstance(node, UnaryOperation):
+        return containsWideConstant(node.operand)
+    if isinstance(node, BinaryOperator):
+        return containsWideConstant(node.expressionLeft) or \
+               containsWideConstant(node.expressionRight)
+    if isinstance(node, Typecast):
+        return is32Bit(node.typeName) or \
+               containsWideConstant(node.castExpression)
+    if isinstance(node, ConditionalExpression):
+        return containsWideConstant(node.conditionExpression) or \
+               containsWideConstant(node.trueExpression) or \
+               containsWideConstant(node.falseExpression)
+    if isinstance(node, Expression):
+        for e in node.expressionList:
+            if containsWideConstant(e):
+                return True
+    return False
+
+
 def evalConstInner(node):
     if isinstance(node, Constant):
         return node.value
@@ -909,7 +936,9 @@ def emitLongConstant(value):
 def loadFromAddress(ctype):
     """value of an lvalue whose address is in r0"""
     if is32Bit(ctype):
-        return "\n\tldr r1,*r0\n\tldo r0,*r0,#1"
+        # word layout: [addr] = hi, [addr+1] = lo (matches VariableAccess
+        # and Assignment)
+        return "\n\tmov r2,r0\n\tldr r0,*r2\n\tldo r1,*r2,#1"
     if ctype.isScalar():
         return "\n\tldr r0,*r0"
     return ""                       # arrays/structs: address is the value
@@ -928,6 +957,48 @@ def isFloat(ctype):
 def is32Bit(ctype):
     """Check if a type is 32-bit (long or float)."""
     return isLong(ctype) or isFloat(ctype)
+
+
+def emitConversion(code, srcType, dstType):
+    """Append code converting the value in r0 (16-bit) / r0:r1 (32-bit)
+    from srcType to dstType.
+
+    int <-> float converts numerically by calling the float32.h runtime
+    helpers (the program must #include <float32.h>).  long <-> float
+    reinterprets the bits: 'long' is the float32 library's carrier type
+    (f32_make, f32_add, ... all traffic in longs), so implicit numeric
+    conversion here would break every direct f32_* call.  Use
+    f32_from_long/f32_to_long for numeric long <-> float conversion."""
+    if srcType is None or dstType is None:
+        return code
+    srcArith = srcType.isScalar() and not srcType.isPointer()
+    dstArith = dstType.isScalar() and not dstType.isPointer()
+    if isFloat(dstType) and not is32Bit(srcType) and srcArith:
+        if getattr(srcType, "isUnsigned", False):
+            # zero-extend and convert as long so 0x8000..0xffff stay positive
+            code += "\n\tmov r1,r0\n\tin r0,#0" \
+                  + "\n\tpush r1\n\tpush r0\n\tcall f32_from_long\n\tpop\n\tpop"
+        else:
+            code += "\n\tpush r0\n\tcall f32_from_int\n\tpop"
+    elif isFloat(srcType) and not is32Bit(dstType) and dstArith:
+        code += "\n\tpush r1\n\tpush r0\n\tcall f32_to_int\n\tpop\n\tpop"
+    elif is32Bit(dstType) and not is32Bit(srcType):
+        code += "\n\tmov r1,r0\n\tin r0,#0"
+    elif not is32Bit(dstType) and is32Bit(srcType):
+        code += "\n\tmov r0,r1"
+    return code
+
+
+def genTruthTest(node):
+    """cmp-against-zero for a just-generated expression value,
+    handling 32-bit operands (long: hi|lo, float: also ignore the
+    sign bit so -0.0 is false)."""
+    t = getattr(node, "ctype", None)
+    if isFloat(t):
+        return "\n\tandi r0,#32767\n\tor r0,r0,r1\n\tcmp r0,#0"
+    if isLong(t):
+        return "\n\tor r0,r0,r1\n\tcmp r0,#0"
+    return "\n\tcmp r0,#0"
 
 
 def genScaledIndex(indexCode, scale):
@@ -1140,21 +1211,32 @@ class FunctionCall(Node):
             expectedType = None
             if idx < len(paramTypes):
                 expectedType = paramTypes[len(paramTypes) - 1 - idx][1]
-            # Emit constant directly in 32-bit if expected type is long
+            # Emit constant directly in 32-bit if expected type is long/float
             longConstVal = None
-            if isLong(expectedType) and isinstance(argument, Constant):
+            if isFloat(expectedType) and isinstance(argument, Constant):
+                longConstVal = floatToBinary32(float(argument.value))
+            elif isLong(expectedType) and isinstance(argument, Constant):
                 longConstVal = argument.value
-            elif isLong(expectedType):
+            elif isLong(expectedType) and not containsWideConstant(argument):
                 try:
                     longConstVal = evalConstInner(argument)
                 except NotConstant:
                     pass
             if longConstVal is not None:
                 code += emitLongConstant(longConstVal)
-                argType = LONG
+                argType = FLOAT if isFloat(expectedType) else LONG
             else:
                 code += argument.generate(scope)
                 argType = argument.ctype
+                # convert to the parameter's width/type: int <-> float
+                # converts numerically, long <-> int widens/narrows
+                # (long <-> float is a bit-level pass-through, see
+                # emitConversion)
+                if expectedType is not None and \
+                        (isFloat(expectedType) != isFloat(argType) or
+                         is32Bit(expectedType) != is32Bit(argType)):
+                    code = emitConversion(code, argType, expectedType)
+                    argType = expectedType
             if argType.isStruct():
                 code += "\n\tmov r1,r0"
                 for i in reversed(range(argType.size)):
@@ -1162,7 +1244,7 @@ class FunctionCall(Node):
                 totalWords += argType.size
             elif is32Bit(argType) or is32Bit(expectedType):
                 # Promote int to long if needed
-                if not isLong(argType):
+                if not is32Bit(argType):
                     code += "\n\tmov r1,r0\n\tin r0,#0"
                 # Push lo first, then hi → hi at r15+3, lo at r15+4
                 code += "\n\tpush r1\n\tpush r0"
@@ -1257,26 +1339,46 @@ class UnaryOperation(Node):
                 fail("cannot dereference this type", self.line)
             return code + loadFromAddress(self.ctype)
 
+        if self.operator == "-" and isinstance(self.operand, Constant):
+            # fold, keeping wide constants 32-bit (-100000000); values
+            # up to 32768 stay 16-bit ints (-32768 is a valid int)
+            value = self.operand.value
+            if value > 0x8000:
+                self.ctype = LONG
+                return emitLongConstant(-value & 0xffffffff)
+            self.ctype = INT
+            return "\n\tin r0,#" + str(-value & 0xffff)
+
         code = self.operand.generate(scope)
         if not self.operand.ctype.isScalar():
             fail("invalid operand to unary " + self.operator, self.line)
         opLong = isLong(self.operand.ctype)
+        opFloat = isFloat(self.operand.ctype)
         if opLong:
             self.ctype = LONG
+        elif opFloat:
+            self.ctype = FLOAT
         else:
             self.ctype = INT
         if self.operator == "-":
-            if opLong:
+            if opFloat:
+                code += "\n\txori r0,#32768"    # flip the sign bit
+            elif opLong:
                 code += "\n\tneg32 er0,er0"
             else:
                 code += "\n\tneg r0,r0"
         elif self.operator == "~":
+            if opFloat:
+                fail("invalid operand to unary ~ (have float)", self.line)
             if opLong:
                 code += "\n\tnot32 er0,er0"
             else:
                 code += "\n\tnot r0,r0"
         elif self.operator == "!":
-            if opLong:
+            self.ctype = INT
+            if opFloat:
+                code += "\n\tandi r0,#32767"    # -0.0 is false too
+            if opLong or opFloat:
                 code += "\n\tor r2,r0,r1" \
                       + "\n\tcmp r2,#0" \
                       + "\n\tmov r0,state" \
@@ -1331,20 +1433,18 @@ class Typecast(Node):
         self.castExpression = castExpression
 
     def generate(self, scope):
+        # (float)intConstant: fold at compile time
+        if isFloat(self.typeName) and isinstance(self.castExpression, Constant):
+            self.ctype = self.typeName
+            bits = floatToBinary32(float(self.castExpression.value))
+            return emitLongConstant(bits)
         code = self.castExpression.generate(scope)
         srcType = self.castExpression.ctype
         dstType = self.typeName
-
-        # Same-size 32-bit types (long <-> float): just pass bits through
-        if is32Bit(srcType) and is32Bit(dstType):
-            pass  # bits are already in er0 (r0:r1)
-        # 32-bit → int: extract low word from r1
-        elif is32Bit(srcType) and not is32Bit(dstType):
-            code += "\n\tmov r0,r1"
-        # int → 32-bit: zero-extend r0 into r0:r1
-        elif not is32Bit(srcType) and is32Bit(dstType):
-            code += "\n\tmov r1,r0\n\tin r0,#0"
-
+        # int <-> float converts numerically; long <-> float passes bits
+        # through (long is the float32 library's carrier type); other
+        # width changes truncate/zero-extend.
+        code = emitConversion(code, srcType, dstType)
         self.ctype = self.typeName
         return code
 
@@ -1371,8 +1471,10 @@ class BinaryOperator(Node):
 
         # constant folding: evaluate at compile time if possible.
         # Skip operators where signed/unsigned matters or where the result
-        # may exceed 16 bits (shifts, division, comparison).
-        if op not in (",", "/", "%", "<", ">", "<=", ">=", ">>", "<<"):
+        # may exceed 16 bits (shifts, division, comparison), and any
+        # expression with wide (32-bit) constants or casts.
+        if op not in (",", "/", "%", "<", ">", "<=", ">=", ">>", "<<") \
+                and not containsWideConstant(self):
             try:
                 result = evalConstInner(self) & 0xffff
                 self.ctype = INT
@@ -1383,6 +1485,9 @@ class BinaryOperator(Node):
         # Peek at operand types to detect 32-bit operations
         def peekType(node):
             t = node.ctype if hasattr(node, 'ctype') else None
+            # wide constants are emitted as 32-bit values
+            if isinstance(node, Constant) and node.value > 0xffff:
+                return LONG
             # If the node is a Typecast to a 32-bit type, use that type
             if isinstance(node, Typecast) and is32Bit(node.typeName):
                 return node.typeName
@@ -1399,6 +1504,56 @@ class BinaryOperator(Node):
                 lt = peekType(node.expressionLeft)
                 if is32Bit(lt):
                     return LONG
+            # Nested arithmetic/bitwise: (x & 0x7FFFFF) | 0x800000
+            if isinstance(node, BinaryOperator) and \
+                    node.operator in ("+", "-", "*", "/", "%", "&", "|", "^"):
+                lt = peekType(node.expressionLeft)
+                rt = peekType(node.expressionRight)
+                if isFloat(lt) or isFloat(rt):
+                    return FLOAT
+                if is32Bit(lt) or is32Bit(rt):
+                    return LONG
+            # Look through unary +/-/~ (e.g.  -x * y  with x long/float)
+            if isinstance(node, UnaryOperation) and node.operator in ("+", "-", "~"):
+                # negated wide constants fold to 32-bit values
+                if node.operator == "-" and isinstance(node.operand, Constant) \
+                        and node.operand.value > 0x8000:
+                    return LONG
+                return peekType(node.operand)
+            # Function calls: use the declared return type
+            if isinstance(node, FunctionCall) and \
+                    isinstance(node.callee, VariableAccess) and \
+                    node.callee.name in cg.functions:
+                return cg.functions[node.callee.name].ctype.returnType
+            # Array element / pointer dereference / struct member
+            if isinstance(node, ArrayAccess):
+                bt = peekType(node.base)
+                if bt is not None and bt.isArray():
+                    return bt.element
+                if bt is not None and bt.isPointer():
+                    return bt.target
+            if isinstance(node, UnaryOperation) and node.operator == "*":
+                pt = peekType(node.operand)
+                if pt is not None and pt.isPointer():
+                    return pt.target
+            if isinstance(node, MemberAccess):
+                bt = peekType(node.base)
+                st = None
+                if node.arrow:
+                    if bt is not None and bt.isPointer() and bt.target.isStruct():
+                        st = bt.target
+                elif bt is not None and bt.isStruct():
+                    st = bt
+                if st is not None and st.members is not None:
+                    for memberName, memberType, _ in st.members:
+                        if memberName == node.memberName:
+                            return memberType
+            # Conditional expression: peek at the branches
+            if isinstance(node, ConditionalExpression):
+                lt = peekType(node.trueExpression)
+                if is32Bit(lt):
+                    return lt
+                return peekType(node.falseExpression)
             return t
         leftPre = peekType(self.expressionLeft)
         rightPre = peekType(self.expressionRight)
@@ -1505,28 +1660,30 @@ class BinaryOperator(Node):
         labelSkip = createUniqueLabel()
         labelEnd = createUniqueLabel()
         if self.operator == "&&":
-            return self.expressionLeft.generate(scope) \
-                 + "\n\tcmp r0,#0" \
+            code = self.expressionLeft.generate(scope)
+            code += genTruthTest(self.expressionLeft) \
                  + "\n\tjeq " + labelSkip \
-                 + self.expressionRight.generate(scope) \
-                 + "\n\tcmp r0,#0" \
+                 + self.expressionRight.generate(scope)
+            code += genTruthTest(self.expressionRight) \
                  + "\n\tjeq " + labelSkip \
                  + "\n\tin r0,#1" \
                  + "\n\tjmp " + labelEnd \
                  + "\n" + labelSkip + ":" \
                  + "\n\tin r0,#0" \
                  + "\n" + labelEnd + ":"
-        return self.expressionLeft.generate(scope) \
-             + "\n\tcmp r0,#0" \
+            return code
+        code = self.expressionLeft.generate(scope)
+        code += genTruthTest(self.expressionLeft) \
              + "\n\tjneq " + labelSkip \
-             + self.expressionRight.generate(scope) \
-             + "\n\tcmp r0,#0" \
+             + self.expressionRight.generate(scope)
+        code += genTruthTest(self.expressionRight) \
              + "\n\tjneq " + labelSkip \
              + "\n\tin r0,#0" \
              + "\n\tjmp " + labelEnd \
              + "\n" + labelSkip + ":" \
              + "\n\tin r0,#1" \
              + "\n" + labelEnd + ":"
+        return code
 
     # Float operation → C helper name
     _floatHelpers = {"+": "f32_add", "-": "f32_sub", "*": "f32_mul", "/": "f32_div"}
@@ -1535,6 +1692,9 @@ class BinaryOperator(Node):
         """Generate float arithmetic/comparison using C runtime helpers.
         C calling convention: push rightmost argument first."""
         op = self.operator
+        if op not in self._floatHelpers and \
+                op not in ("==", "!=", "<", ">", "<=", ">="):
+            fail("invalid operands to binary %s (have float)" % op, self.line)
 
         # Generate left, save; generate right; rearrange so left is on top (pushed last)
         code = leftCode
@@ -1578,18 +1738,24 @@ class BinaryOperator(Node):
     _longCmpMask = {"==": (16, 4), "!=": (32, 5), "<": (4, 2), ">": (64, 6)}
 
     def _genLongOperand(self, node, scope):
-        """Generate a 32-bit operand. For Constants, emit full 32-bit.
-        For other int nodes, promote to long."""
+        """Generate a 32-bit operand without promotion. For Constants,
+        emit full 32-bit. Returns (code, ctype)."""
         if isinstance(node, Constant):
             return emitLongConstant(node.value), LONG
         if isinstance(node, FloatConstant):
             c = node.generate(scope)
             return c, FLOAT
         code = node.generate(scope)
-        ctype = node.ctype
-        if not is32Bit(ctype):
-            code += "\n\tmov r1,r0\n\tin r0,#0"
-        return code, ctype
+        return code, node.ctype
+
+    def _toFloatOperand(self, node, code, ctype):
+        """Make a generated operand a float: fold int constants, convert
+        int values with f32_from_int, pass long bits through."""
+        if isFloat(ctype):
+            return code
+        if isinstance(node, Constant):
+            return emitLongConstant(floatToBinary32(float(node.value)))
+        return emitConversion(code, ctype, FLOAT)
 
     def generate32(self, scope):
         """Generate 32-bit code for long or float operands."""
@@ -1599,7 +1765,15 @@ class BinaryOperator(Node):
 
         floatOp = isFloat(leftType) or isFloat(rightType)
         if floatOp:
-            return self._generateFloatOp(scope, leftCode, leftType, rightCode, rightType)
+            leftCode = self._toFloatOperand(self.expressionLeft, leftCode, leftType)
+            rightCode = self._toFloatOperand(self.expressionRight, rightCode, rightType)
+            return self._generateFloatOp(scope, leftCode, FLOAT, rightCode, FLOAT)
+
+        # promote 16-bit operands to long (zero-extend)
+        if not is32Bit(leftType):
+            leftCode += "\n\tmov r1,r0\n\tin r0,#0"
+        if not is32Bit(rightType):
+            rightCode += "\n\tmov r1,r0\n\tin r0,#0"
 
         unsignedDiv = ((op == "/" or op == "%") and
                        (getattr(leftType, 'isUnsigned', False) or
@@ -1709,8 +1883,8 @@ class ConditionalExpression(Node):
     def generate(self, scope):
         labelFalse = createUniqueLabel()
         labelEnd = createUniqueLabel()
-        code = self.conditionExpression.generate(scope) \
-             + "\n\tcmp r0,#0" \
+        code = self.conditionExpression.generate(scope)
+        code += genTruthTest(self.conditionExpression) \
              + "\n\tjeq " + labelFalse \
              + self.trueExpression.generate(scope) \
              + "\n\tjmp " + labelEnd \
@@ -1734,24 +1908,24 @@ class Assignment(Node):
 
     def generate(self, scope):
         if self.operator == "=":
-            targetType = self.target.ctype if hasattr(self.target, 'ctype') else None
-            # Peek at target type before generating value
-            if targetType is None and isinstance(self.target, VariableAccess):
-                s = self.target.resolve(scope)
-                if not isinstance(s, str) and s is not None:
-                    targetType = s.ctype
+            # Generate the target address first so the target type is known
+            # (the emitted code still evaluates the value first)
+            addressCode = self.target.generateAddress(scope)
+            targetType = self.target.ctype
             # For 32-bit targets with constant values, emit full 32-bit
             if is32Bit(targetType) and isinstance(self.valueExpression, (Constant, FloatConstant)):
                 if isinstance(self.valueExpression, FloatConstant):
                     valueCode = self.valueExpression.generate(scope)
+                elif isFloat(targetType):
+                    # float f; f = 5;  → fold the int→float conversion
+                    valueCode = emitLongConstant(
+                        floatToBinary32(float(self.valueExpression.value)))
                 else:
                     valueCode = emitLongConstant(self.valueExpression.value)
                 valueType = targetType
             else:
                 valueCode = self.valueExpression.generate(scope)
                 valueType = self.valueExpression.ctype
-            addressCode = self.target.generateAddress(scope)
-            targetType = self.target.ctype
             self.ctype = targetType
 
             if targetType.isConst:
@@ -1775,9 +1949,8 @@ class Assignment(Node):
                 fail("cannot assign to an array", self.line)
             if is32Bit(targetType):
                 # 32-bit assignment: value is in r0:r1, store both words
-                if not is32Bit(valueType):
-                    # promote int to 32-bit: hi=0, lo=r0
-                    valueCode += "\n\tmov r1,r0\n\tin r0,#0"
+                # (int→float converts, int→long zero-extends)
+                valueCode = emitConversion(valueCode, valueType, targetType)
                 return valueCode \
                      + "\n\tpush r0" \
                      + "\n\tpush r1" \
@@ -1787,6 +1960,9 @@ class Assignment(Node):
                      + "\n\tpop r0" \
                      + "\n\tstor *r2,r0" \
                      + "\n\tstoo *r2,#1,r1"
+            # 16-bit target: convert a float value (f32_to_int) or take
+            # the low word of a long
+            valueCode = emitConversion(valueCode, valueType, targetType)
             return valueCode \
                  + "\n\tpush r0" \
                  + addressCode \
@@ -1803,6 +1979,18 @@ class Assignment(Node):
             warn("assignment to const-qualified variable", self.line)
         if not targetType.isScalar():
             fail("invalid target for " + self.operator, self.line)
+
+        if is32Bit(targetType):
+            # long/float compound assignment: desugar to  target = target op
+            # value.  (The target lvalue is evaluated twice; fine for the
+            # simple lvalues this compiler supports.)
+            operation = BinaryOperator(op, self.target, self.valueExpression)
+            operation.line = self.line
+            assignment = Assignment("=", self.target, operation)
+            assignment.line = self.line
+            code = assignment.generate(scope)
+            self.ctype = assignment.ctype
+            return code
 
         valueCode = self.valueExpression.generate(scope)
         if targetType.isPointer() and op in ("+", "-"):
@@ -1898,8 +2086,8 @@ class ConditionalStatement(Node):
     def generate(self, scope):
         labelElse = createUniqueLabel()
         labelEnd = createUniqueLabel()
-        code = self.expression.generate(scope) \
-             + "\n\tcmp r0,#0" \
+        code = self.expression.generate(scope)
+        code += genTruthTest(self.expression) \
              + "\n\tjeq " + labelElse \
              + self.thenStatement.generate(scope) \
              + "\n\tjmp " + labelEnd \
@@ -1922,8 +2110,8 @@ class WhileLoop(Node):
         ctx.breakLabels.append(labelEnd)
         ctx.continueLabels.append(labelStart)
         code = "\n" + labelStart + ":" \
-             + self.expression.generate(scope) \
-             + "\n\tcmp r0,#0" \
+             + self.expression.generate(scope)
+        code += genTruthTest(self.expression) \
              + "\n\tjeq " + labelEnd \
              + self.statement.generate(scope) \
              + "\n\tjmp " + labelStart \
@@ -1948,8 +2136,8 @@ class DoWhileLoop(Node):
         code = "\n" + labelStart + ":" \
              + self.statement.generate(scope) \
              + "\n" + labelCondition + ":" \
-             + self.expression.generate(scope) \
-             + "\n\tcmp r0,#0" \
+             + self.expression.generate(scope)
+        code += genTruthTest(self.expression) \
              + "\n\tjneq " + labelStart \
              + "\n" + labelEnd + ":"
         ctx.breakLabels.pop()
@@ -1976,8 +2164,8 @@ class ForLoop(Node):
             code += self.initialExpression.generate(scope)
         code += "\n" + labelCondition + ":"
         if self.conditionalExpression is not None:
-            code += self.conditionalExpression.generate(scope) \
-                  + "\n\tcmp r0,#0" \
+            code += self.conditionalExpression.generate(scope)
+            code += genTruthTest(self.conditionalExpression) \
                   + "\n\tjeq " + labelEnd
         code += self.statement.generate(scope) \
               + "\n" + labelContinue + ":"
@@ -2101,21 +2289,30 @@ class Return(Node):
 
     def generate(self, scope):
         code = ""
-        returnsLong = isLong(cg.currentFunction.returnType)
+        returnType = cg.currentFunction.returnType
+        returns32 = is32Bit(returnType)
         if self.expression is not None:
-            code += self.expression.generate(scope)
-            exprType = self.expression.ctype
-            if exprType.isStruct():
-                fail("returning structs by value is not supported", self.line)
-            # Promote int to long if function returns long
-            if returnsLong and not isLong(exprType):
-                code += "\n\tmov r1,r0\n\tin r0,#0"
-        elif cg.currentFunction.returnType.kind != "void":
+            if isFloat(returnType) and isinstance(self.expression, Constant):
+                # return 5; from a float function: fold the conversion
+                code += emitLongConstant(
+                    floatToBinary32(float(self.expression.value)))
+            elif is32Bit(returnType) and isinstance(self.expression, Constant):
+                # full 32-bit constant (return 0x7FFFFFFF; from a long fn)
+                code += emitLongConstant(self.expression.value)
+            else:
+                code += self.expression.generate(scope)
+                exprType = self.expression.ctype
+                if exprType.isStruct():
+                    fail("returning structs by value is not supported",
+                         self.line)
+                # int <-> float conversion / int -> long promotion
+                code = emitConversion(code, exprType, returnType)
+        elif returnType.kind != "void":
             warn("return without value in non-void function '%s'"
                  % cg.currentFunction.name, self.line)
-            if returnsLong:
+            if returns32:
                 code += "\n\tin r0,#0\n\tin r1,#0"
-        if returnsLong:
+        if returns32:
             # 'ret' uses r1 (pop r1; jmpr r1), which destroys the lo word.
             # Use r2 for the return address instead to preserve er0 (r0:r1).
             code += "\n\tmov sp,r15" \
@@ -2248,6 +2445,10 @@ class Declaration(Node):
             elif is32Bit(ctype) and isinstance(initializer, (Constant, FloatConstant)):
                 if isinstance(initializer, FloatConstant):
                     code += initializer.generate(scope)
+                elif isFloat(ctype):
+                    # float f = 5;  → fold the int→float conversion
+                    code += emitLongConstant(
+                        floatToBinary32(float(initializer.value)))
                 else:
                     code += emitLongConstant(initializer.value)
                 code += "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0" \
@@ -2255,18 +2456,25 @@ class Declaration(Node):
             elif is32Bit(ctype):
                 # Try constant folding for unary-minus etc.
                 try:
+                    if containsWideConstant(initializer):
+                        raise NotConstant()
                     val = evalConstInner(initializer)
+                    if isFloat(ctype):
+                        val = floatToBinary32(float(val))
                     code += emitLongConstant(val) \
                           + "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0" \
                           + "\n\tstoo *r15,#" + str((offset + 1) & 0xffff) + ",r1"
                 except NotConstant:
-                    # Non-constant — promote int to 32-bit
-                    code += initializer.generate(scope) \
-                          + "\n\tmov r1,r0\n\tin r0,#0" \
+                    # Non-constant — convert/promote to the declared type
+                    initCode = initializer.generate(scope)
+                    initCode = emitConversion(initCode, initializer.ctype, ctype)
+                    code += initCode \
                           + "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0" \
                           + "\n\tstoo *r15,#" + str((offset + 1) & 0xffff) + ",r1"
             else:
-                code += initializer.generate(scope) \
+                initCode = initializer.generate(scope)
+                initCode = emitConversion(initCode, initializer.ctype, ctype)
+                code += initCode \
                       + "\n\tstoo *r15,#" + str(offset & 0xffff) + ",r0"
         return code
 
@@ -2295,8 +2503,13 @@ def recordGlobalInit(ctype, address, initializer, line):
     else:
         if not ctype.isScalar():
             fail("invalid global initializer", line)
-        value = constInitValue(initializer, line)
-        cg.globalInits.append((address, value))
+        if is32Bit(ctype):
+            value = constInitValue32(ctype, initializer, line)
+            cg.globalInits.append((address, (value >> 16) & 0xffff))
+            cg.globalInits.append((address + 1, value & 0xffff))
+        else:
+            value = constInitValue(initializer, line)
+            cg.globalInits.append((address, value))
 
 
 def constInitValue(node, line):
@@ -2313,6 +2526,19 @@ def constInitValue(node, line):
         return evalConstInner(node) & 0xffff
     except NotConstant:
         fail("global initializer is not constant", line)
+
+
+def constInitValue32(ctype, node, line):
+    """constant initializer for a long or float global: full 32-bit value"""
+    if isinstance(node, FloatConstant):
+        return node.bits
+    try:
+        value = evalConstInner(node)
+    except NotConstant:
+        fail("global initializer is not constant", line)
+    if isFloat(ctype):
+        return floatToBinary32(float(value))
+    return value & 0xffffffff
 
 
 class GlobalDeclaration(Node):
@@ -2908,7 +3134,11 @@ class Parser:
             return self.mark(PreIncDec(self.parseUnaryExpression(), "--"))
         if token.type in UnaryOperation.operators:
             self.next()
-            return self.mark(UnaryOperation(token.type, self.parseCastExpression()))
+            operand = self.parseCastExpression()
+            if token.type == "-" and isinstance(operand, FloatConstant):
+                # fold -1.5 into a constant so initializers stay constant
+                return self.mark(FloatConstant(operand.bits ^ 0x80000000))
+            return self.mark(UnaryOperation(token.type, operand))
         if token.type == "sizeof":
             self.next()
             if self.peek().type == "(" and self.startsTypeNameAfterParen():

@@ -72,7 +72,7 @@ The shell reads commands from the input ROM (page 0xb); there is no keyboard.
 
 ### libc (`compiler/lib/`)
 
-Header-only (no linker). `stdio.h` provides `putchar`/`getchar`/`puts`/`printf` (varargs via `&fixedParam + 1`). `stdlib.h` provides `malloc` (bump allocator from 0x8000, `free` is no-op). `string.h` provides standard string/memory functions. `softfloat.h` provides IEEE-754 binary16 software floating point (add/sub/mul/div/cmp/print).
+Header-only (no linker). `stdio.h` provides `putchar`/`getchar`/`puts`/`printf` (varargs via `&fixedParam + 1`). `stdlib.h` provides `malloc` (bump allocator from 0x8000, `free` is no-op). `string.h` provides standard string/memory functions. `softfloat.h` provides IEEE-754 binary16 software floating point (add/sub/mul/div/cmp/print). `float32.h` provides IEEE-754 binary32 backing the compiler's `float` type: full 24-bit-mantissa add/sub/mul/div (round toward zero, ≤1 ulp; denormals flush to zero), comparison, int/long conversions, and decimal/hex printing. Programs using `float` arithmetic or casts must `#include <float32.h>`. `long` is the library's carrier type: `f32_*` functions traffic in raw bit patterns, so `long`↔`float` conversion is a bit-level pass-through (use `f32_from_long`/`f32_to_long` for numeric conversion), while `int`↔`float` converts numerically.
 
 ## Key constraints
 
