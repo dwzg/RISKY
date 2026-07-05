@@ -674,6 +674,36 @@ void fs_dir_list(int dir_ino)
 
 int fs_resolve(char *path);
 
+/* Parse an absolute path into parent inode + basename.
+ * e.g. "/foo/bar" → *parent = fs_resolve("/foo"), name = "bar".
+ * e.g. "/bar"     → *parent = 0 (root), name = "bar".
+ * Returns 0 on success, -1 on error. */
+static int fs_parse_parent(char *path, int *parent, char *name)
+{
+    int i, slash_pos;
+    if (path[0] != '/') return -1;
+    slash_pos = 0;
+    for (i = 0; path[i]; i++)
+        if (path[i] == '/') slash_pos = i;
+    if (slash_pos == 0) {
+        *parent = 0;
+        for (i = 0; i < 31 && path[i+1]; i++)
+            name[i] = path[i+1];
+        name[i] = 0;
+    } else {
+        char dir[32];
+        for (i = 0; i < slash_pos && i < 31; i++)
+            dir[i] = path[i];
+        dir[slash_pos < 31 ? slash_pos : 31] = 0;
+        *parent = fs_resolve(dir);
+        if (*parent < 0) return -1;
+        for (i = 0; i < 31 && path[slash_pos+1+i]; i++)
+            name[i] = path[slash_pos+1+i];
+        name[i] = 0;
+    }
+    return 0;
+}
+
 /* Remove a directory entry by setting its inode to -1. */
 int fs_dir_remove(int dir_ino, char *name)
 {
@@ -703,33 +733,11 @@ int fs_dir_remove(int dir_ino, char *name)
 /* Delete a file by path. Frees all data blocks and the inode. */
 int fs_unlink(char *path)
 {
-    int parent, ino, i, slash_pos;
+    int parent, ino, i;
     char name[32];
     long blk;
 
-    if (path[0] != '/') return -1;
-
-    /* find the last '/' to split dirname / basename */
-    slash_pos = 0;
-    for (i = 0; path[i]; i++)
-        if (path[i] == '/') slash_pos = i;
-
-    if (slash_pos == 0) {
-        parent = 0;
-        for (i = 0; i < 31 && path[i+1]; i++)
-            name[i] = path[i+1];
-        name[i] = 0;
-    } else {
-        for (i = 0; i < slash_pos; i++)
-            name[i] = path[i];
-        name[slash_pos] = 0;
-        parent = fs_resolve(name);
-        for (i = 0; i < 31 && path[slash_pos+1+i]; i++)
-            name[i] = path[slash_pos+1+i];
-        name[i] = 0;
-    }
-
-    if (parent < 0) return -1;
+    if (fs_parse_parent(path, &parent, name) < 0) return -1;
     if (parent == 0 && name[0] == 0) return -1;
 
     ino = fs_dir_lookup(parent, name);
@@ -749,6 +757,92 @@ int fs_unlink(char *path)
     fs_type[ino] = 0;
     fs_size[ino] = 0;
     fs_name[ino][0] = 0;
+
+    return 0;
+}
+
+/* Move/rename a file or directory. */
+int sys_move(char *src, char *dst)
+{
+    int src_parent, dst_parent, src_ino, existing, i;
+    char src_name[32], dst_name[32];
+    long blk;
+
+    if (fs_parse_parent(src, &src_parent, src_name) < 0) return -1;
+    src_ino = fs_dir_lookup(src_parent, src_name);
+    if (src_ino < 0) return -1;
+    if (src_ino == 0) return -1;   /* can't move root */
+
+    if (fs_parse_parent(dst, &dst_parent, dst_name) < 0) return -1;
+    if (dst_parent < 0 || fs_type[dst_parent] != 2) return -1;
+    if (dst_name[0] == 0) return -1;
+
+    /* if destination exists, remove it first */
+    existing = fs_dir_lookup(dst_parent, dst_name);
+    if (existing >= 0) {
+        if (fs_type[existing] == 2) return -1;  /* can't overwrite a dir */
+        for (i = 0; i < FS_DIRECT; i++) {
+            blk = fs_blocks[existing][i];
+            if (blk != 0) { fs_free_block(blk); fs_blocks[existing][i] = 0; }
+        }
+        fs_dir_remove(dst_parent, dst_name);
+        fs_type[existing] = 0; fs_size[existing] = 0;
+        fs_name[existing][0] = 0;
+    }
+
+    /* move entry from source dir to destination dir */
+    fs_dir_remove(src_parent, src_name);
+    fs_dir_add(dst_parent, dst_name, src_ino);
+
+    /* update inode name */
+    for (i = 0; i < FS_NAMELEN - 1 && dst_name[i]; i++)
+        fs_name[src_ino][i] = dst_name[i];
+    fs_name[src_ino][i] = 0;
+
+    return 0;
+}
+
+/* Copy a file. */
+int sys_copy(char *src, char *dst)
+{
+    int src_ino, dst_parent, dst_ino, existing, i, offset, n;
+    char dst_name[32];
+    int buf[64];
+    long blk;
+
+    src_ino = fs_resolve(src);
+    if (src_ino < 0 || fs_type[src_ino] != 1) return -1;
+
+    if (fs_parse_parent(dst, &dst_parent, dst_name) < 0) return -1;
+    if (dst_parent < 0 || fs_type[dst_parent] != 2) return -1;
+    if (dst_name[0] == 0) return -1;
+
+    /* if destination exists, remove it */
+    existing = fs_dir_lookup(dst_parent, dst_name);
+    if (existing >= 0) {
+        if (fs_type[existing] != 1) return -1;
+        for (i = 0; i < FS_DIRECT; i++) {
+            blk = fs_blocks[existing][i];
+            if (blk != 0) { fs_free_block(blk); fs_blocks[existing][i] = 0; }
+        }
+        fs_dir_remove(dst_parent, dst_name);
+        fs_type[existing] = 0; fs_size[existing] = 0;
+        fs_name[existing][0] = 0;
+    }
+
+    /* create destination inode */
+    dst_ino = fs_ialloc(1, dst_name);
+    if (dst_ino < 0) return -1;
+    fs_dir_add(dst_parent, dst_name, dst_ino);
+
+    /* copy data in chunks */
+    offset = 0;
+    while (offset < (int)fs_size[src_ino]) {
+        n = fs_readi(src_ino, offset, buf, 64);
+        if (n <= 0) break;
+        fs_writei(dst_ino, offset, buf, n);
+        offset += n;
+    }
 
     return 0;
 }
@@ -1041,7 +1135,7 @@ int sh_exec_cmd(char *cmd, char *arg)
     int fd, fds[2], pid;
 
     if (scmp(cmd, "help") == 0) {
-        puts("help ps ls cat mkfile mkdir rm pipe write echo nice sleep prio exit");
+        puts("help ps ls cat mkfile mkdir rm mv cp edit pipe write echo nice sleep prio exit");
     } else if (scmp(cmd, "ps") == 0) {
         sh_ps();
     } else if (scmp(cmd, "ls") == 0) {
@@ -1129,6 +1223,25 @@ int sh_exec_cmd(char *cmd, char *arg)
     } else if (scmp(cmd, "rm") == 0) {
         if (arg[0] == 0) { puts("rm: missing path"); }
         else if (sys_unlink(arg) < 0) { puts("rm: failed"); }
+    } else if (scmp(cmd, "mv") == 0 || scmp(cmd, "cp") == 0) {
+        char src[32], dst[32];
+        int si, di, is_mv;
+        is_mv = (cmd[0] == 'm');
+        /* parse first arg */
+        for (si = 0; arg[si] && arg[si] != ' ' && arg[si] != '\t' && si < 31; si++)
+            src[si] = arg[si];
+        src[si] = 0;
+        while (arg[si] == ' ' || arg[si] == '\t') si++;
+        /* parse second arg */
+        for (di = 0; arg[si+di] && arg[si+di] != ' ' && arg[si+di] != '\t' && di < 31; di++)
+            dst[di] = arg[si+di];
+        dst[di] = 0;
+        if (src[0] == 0 || dst[0] == 0)
+            printf("usage: %s <src> <dst>\n", cmd);
+        else if (is_mv && sys_move(src, dst) < 0)
+            puts("mv: failed");
+        else if (!is_mv && sys_copy(src, dst) < 0)
+            puts("cp: failed");
     } else if (scmp(cmd, "edit") == 0) {
         editor_task(arg);
     } else if (scmp(cmd, "exit") == 0) {
