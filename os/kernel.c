@@ -1039,7 +1039,7 @@ void sh_run_pipeline(char *line)
             tcmd[j] = s[j];
         tcmd[j] = 0;
         while (s[j] == ' ' || s[j] == '\t') j++;
-        for (k = 0; s[j + k] && k < 31; k++)
+        for (k = 0; s[j + k] && s[j + k] != ' ' && s[j + k] != '\t' && k < 31; k++)
             targ[k] = s[j + k];
         targ[k] = 0;
 

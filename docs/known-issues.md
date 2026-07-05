@@ -2,46 +2,32 @@
 
 ## Compiler
 
-### fs_resolve fails with non-literal string pointers at certain call depths
-
-**Status:** Worked around (kernel-side), root cause unknown.
-
-`fs_resolve()` returns -1 when called with a pointer to a non-literal
-string (variable, array element, file-scope global buffer) from within
-the pipe-spawn loop or from within pipe-segment processes.  String
-literals (e.g. `fs_resolve("/motd")`) always work, as do calls from
-`shell_task` and the top of `sh_run_pipeline`.
-
-The trigger appears to be any variable-indexed array read (`arr[i]`)
-performed before the `fs_resolve` call — the read somehow corrupts the
-compiler's ability to pass the string pointer correctly through the
-call chain.  The array size also matters: a 6-word local works, a
-17-word local does not.
-
-**Workaround in the kernel:** File paths are pre-resolved with
-`fs_resolve()` at the top of `sh_run_pipeline()` (before pipe creation
-and spawning).  The resolved inode is stored in `sh_seg_ino[pid]` and
-consumed by `sh_cat_inode()`, avoiding any `fs_resolve` call inside
-the spawn loop or pipe segment.
-
-**Reproducing:** Move the `fs_resolve(ta)` call from the top of
-`sh_run_pipeline` into the spawn loop (around `targ`), or call it from
-`sh_pipe_segment_task`.  `cat /motd | cat` will break with "not found".
+No known compiler bugs at this time.  (The `fs_resolve` issue
+previously attributed to the compiler was traced to a shell argument
+parsing bug — see OS / Kernel below.)
 
 ---
 
-### Global arrays accessed with variable index may produce wrong addresses
+## OS / Kernel
 
-**Status:** Suspected, not confirmed.
+### Shell pipe argument parsing includes trailing whitespace (FIXED)
 
-In the spawn loop of `sh_run_pipeline`, writing to `sh_seg_ino[pid]`
-with a file-scope global buffer and reading it back via
-`sh_seg_ino[cur_pid]` in the child process appeared to access
-different memory locations (the child read 0).  The generated assembly
-looked correct, suggesting a runtime addressing issue.
+**Status:** Fixed (2026-07-05).
 
-This may be the same underlying bug as the `fs_resolve`
-string-pointer issue, or a separate register-allocation problem.
+The argument parser in the spawn loop of `sh_run_pipeline` copied
+characters until null (`\0`), which included the space before the `|`
+pipe character.  A command like `cat /motd | cat` would pass
+`/motd ` (with trailing space) as the file path, causing `fs_resolve`
+to fail with -1 ("not found").
+
+The pre-resolve step at the top of `sh_run_pipeline` used a different
+parser that stopped at spaces, which is why pre-resolving worked.
+
+**Fix:** The spawn loop argument parser (`for (k = 0; s[j+k]; k++)`)
+now also stops at spaces and tabs, matching the pre-resolve parser's
+behavior.
+
+### Global FD table (not per-process)
 
 ---
 
