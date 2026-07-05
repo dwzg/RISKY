@@ -5,19 +5,22 @@ Features discussed but not yet implemented. Roughly ordered by impact.
 ## OS improvements
 
 ### IPC & concurrency
-- **Proper pipe semantics:** `pipe_read` should block when the buffer is
-  empty (not just return 0). `pipe_write` should block when the buffer
-  is full. Currently both return short counts.
-- **Pipe between processes in the shell:** `echo hello | cat` — fork a
-  writer process with stdout redirected to the pipe, fork a reader with
-  stdin from the pipe. Requires `dup2`-style FD redirection.
+- ✅ **Proper pipe semantics:** `pipe_read` blocks when the buffer is
+  empty (if writers still exist), returns 0 on EOF. `pipe_write` blocks
+  when the buffer is full (if readers still exist), returns -1 on broken
+  pipe. Wakeup tracking via `pipe_wait_rd`/`pipe_wait_wr`.
+- ✅ **Pipe between processes in the shell:** `echo hello | cat` —
+  pipeline parsing (`|`), `sys_dup2` for FD redirection, per-segment
+  processes spawned with priority ordering (writer before reader).
 - **Signals:** simple software signals (SIGCHLD for child exit, SIGPIPE
   for broken pipe). No signal handlers needed initially — just default
   actions.
-- **Priority scheduling:** add a `priority` field; `sched_next()`
-  chooses the highest-priority ready task.
-- **Sleep/wakeup:** `proc_sleep(ticks)` — block for N scheduler
-  activations. Needs a tick counter incremented on each context switch.
+- ✅ **Priority scheduling:** `p_priority` field; `sched_next()`
+  chooses the highest-priority ready task with round-robin tie-breaking
+  among equal priorities.
+- ✅ **Sleep/wakeup:** `proc_sleep(ticks)` — block for N scheduler
+  activations. `sys_tick` incremented on each context switch. Sleepers
+  auto-wake when `sys_tick >= p_sleep_until`.
 
 ### File system
 - **Multi-page storage:** use pages 1–7 for file data. Inode block

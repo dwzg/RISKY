@@ -1,4 +1,4 @@
-/* Mandelbrot set, 31×8, for the Logisim TTY.
+/* Mandelbrot set, 80×24, for the Logisim TTY.
  *
  * Q11.4 fixed point (scale = 16).  Products fit in 16 bits.
  * All down-scaling uses signed division (/ SCALE), not >>,
@@ -9,9 +9,9 @@
 #include <stdio.h>
 
 #define SCALE 16
-#define WIDTH  31
-#define HEIGHT  8
-#define ITERS  12
+#define WIDTH  80
+#define HEIGHT 24
+#define ITERS  24
 
 int main(void)
 {
@@ -19,17 +19,16 @@ int main(void)
     int zr, zi, zr2, zi2;
     int cx, cy;
     /* Centered on the main cardioid at c ~= -0.75 + 0i.
-     * Visual aspect 31:16 ~ 2:1, so x_range:y_range = 2:1. */
+     * Visual aspect 80:48 ~ 5:3, so x_range:y_range = 5:3. */
     int xmin = (-3 * SCALE) / 2;     /*  -1.500 */
     int xmax = 0;                    /*   0.000 */
-    int ymax = (3 * SCALE) / 8;      /*   0.375 */
+    int ymax = (9 * SCALE) / 20;     /*   0.450 */
     int ymin = -ymax;
     int limit = 4 * SCALE;           /*   4.0 * 16 = 64 */
-    char shade[] = " .:-=+*#";
+    char shade[] = " .:-=+*#%@";
 
     /* Accumulate coordinates with 4 extra fractional bits (Q15.4) to
-     * avoid the step being truncated to 0 by integer division.
-     * dx_q = ((xmax-xmin) << 4) / (WIDTH-1), dy_q = same for y. */
+     * avoid the step being truncated to 0 by integer division. */
     int cy_q = ymax << 4;                    /* Q15.4 */
     int dx_q = ((xmax - xmin) << 4) / (WIDTH - 1);
     int dy_q = ((ymax - ymin) << 4) / (HEIGHT - 1);
@@ -53,7 +52,7 @@ int main(void)
                 zr = zr2 - zi2 + cx;
                 n++;
             }
-            putchar(shade[n >= ITERS ? 6 : n / 3]);
+            putchar(shade[n >= ITERS ? 8 : n * 8 / ITERS]);
             cx_q += dx_q;
         }
         if (row < HEIGHT - 1)

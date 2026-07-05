@@ -16,35 +16,80 @@
 #define STK_WORDS   512
 #define MSG_Q       8
 
+/* process states */
+#define S_FREE      0
+#define S_READY     1
+#define S_BLOCKED   2
+#define S_ZOMBIE    3
+#define S_SLEEP     4
+
 #define SAVE_SP    0x7FF0
 #define SAVE_R15   0x7FF1
 #define NEXT_SP    0x7FF2
 #define NEXT_R15   0x7FF3
 
 int p_sp[MAX_PROCS], p_r15[MAX_PROCS];
-int p_state[MAX_PROCS];      /* 0=free 1=ready 2=blocked 3=zombie */
+int p_state[MAX_PROCS];      /* 0=free 1=ready 2=blocked 3=zombie 4=sleep */
 int p_ppid[MAX_PROCS];
 int p_exit[MAX_PROCS];
 int p_wait4[MAX_PROCS];
+int p_priority[MAX_PROCS];   /* higher number = higher priority */
+int p_sleep_until[MAX_PROCS]; /* tick when sleep expires, 0=none */
 int p_msgs[MAX_PROCS][MSG_Q];
 int p_msgcnt[MAX_PROCS];
 int p_msgnext[MAX_PROCS];
 int p_name[MAX_PROCS][4];
 int cur_pid;
+int sys_tick;                 /* scheduler tick counter */
 
 static int stk_pool[MAX_PROCS][STK_WORDS];
 
+/* Wake sleepers whose time has come, then pick the highest-priority
+ * ready process.  Round-robin tie-break among equal priorities. */
 int sched_next(int cur)
-{ int n = cur; do { n = (n+1) % MAX_PROCS; } while (p_state[n] != 1); return n; }
+{
+    int i, best, best_pri;
+    /* wake expired sleepers */
+    for (i = 0; i < MAX_PROCS; i++) {
+        if (p_state[i] == S_SLEEP && p_sleep_until[i] > 0
+            && sys_tick >= p_sleep_until[i]) {
+            p_state[i] = S_READY;
+            p_sleep_until[i] = 0;
+        }
+    }
+    /* highest priority among ready procs */
+    best_pri = -1;
+    for (i = 0; i < MAX_PROCS; i++)
+        if (p_state[i] == S_READY && p_priority[i] > best_pri)
+            best_pri = p_priority[i];
+    if (best_pri < 0) return cur;   /* nothing ready — idle */
+    /* round-robin within that priority band, starting after cur */
+    for (i = 1; i <= MAX_PROCS; i++) {
+        int n = (cur + i) % MAX_PROCS;
+        if (p_state[n] == S_READY && p_priority[n] == best_pri)
+            return n;
+    }
+    return cur;
+}
 
 void __sched(void)
 {
     int *s = (int *) SAVE_SP;
     p_sp[cur_pid]  = s[0];
     p_r15[cur_pid] = s[1];
-    do { cur_pid = (cur_pid+1) % MAX_PROCS; } while (p_state[cur_pid] != 1);
+    sys_tick++;
+    cur_pid = sched_next(cur_pid);
     s[2] = p_sp[cur_pid];
     s[3] = p_r15[cur_pid];
+}
+
+/* Block the current process for at least `ticks` scheduler activations. */
+void proc_sleep(int ticks)
+{
+    if (ticks <= 0) return;
+    p_sleep_until[cur_pid] = sys_tick + ticks;
+    p_state[cur_pid] = S_SLEEP;
+    yield();
 }
 
 __naked void yield(void)
@@ -62,14 +107,15 @@ int proc_spawn(void (*fn)(void), int ppid, char *name)
 {
     int pid, i, *stack, *sp;
     for (pid = 0; pid < MAX_PROCS; pid++)
-        if (p_state[pid] == 0) break;
+        if (p_state[pid] == S_FREE) break;
     if (pid == MAX_PROCS) return -1;
     stack = stk_pool[pid];
     sp = stack + STK_WORDS - 4;
     sp[1] = (int) fn; sp[0] = 0; sp[-1] = (int) pid;
     p_sp[pid] = (int) sp; p_r15[pid] = (int)(sp + 1);
-    p_state[pid] = 1; p_ppid[pid] = ppid; p_exit[pid] = 0;
+    p_state[pid] = S_READY; p_ppid[pid] = ppid; p_exit[pid] = 0;
     p_wait4[pid] = -1; p_msgcnt[pid] = 0; p_msgnext[pid] = 0;
+    p_priority[pid] = 0; p_sleep_until[pid] = 0;
     for (i = 0; name[i] && i < 4; i++) p_name[pid][i] = name[i];
     for (; i < 4; i++) p_name[pid][i] = 0;
     return pid;
@@ -78,9 +124,10 @@ int proc_spawn(void (*fn)(void), int ppid, char *name)
 void proc_exit(int code)
 {
     int pp = p_ppid[cur_pid];
-    p_exit[cur_pid] = code; p_state[cur_pid] = 3;
-    if (pp >= 0 && p_state[pp] == 2 && (p_wait4[pp] == cur_pid || p_wait4[pp] == -1))
-        p_state[pp] = 1;
+    p_exit[cur_pid] = code; p_state[cur_pid] = S_ZOMBIE;
+    if (pp >= 0 && p_state[pp] == S_BLOCKED
+        && (p_wait4[pp] == cur_pid || p_wait4[pp] == -1))
+        p_state[pp] = S_READY;
     while (1) yield();
 }
 
@@ -88,30 +135,34 @@ int proc_wait(int pid)
 {
     int i;
     for (i = 0; i < MAX_PROCS; i++)
-        if (p_state[i] == 3 && p_ppid[i] == cur_pid && (pid == -1 || pid == i))
-        { int c = p_exit[i]; p_state[i] = 0; return c; }
-    p_wait4[cur_pid] = pid; p_state[cur_pid] = 2; yield();
+        if (p_state[i] == S_ZOMBIE && p_ppid[i] == cur_pid
+            && (pid == -1 || pid == i))
+        { int c = p_exit[i]; p_state[i] = S_FREE; return c; }
+    p_wait4[cur_pid] = pid; p_state[cur_pid] = S_BLOCKED; yield();
     for (i = 0; i < MAX_PROCS; i++)
-        if (p_state[i] == 3 && p_ppid[i] == cur_pid && (pid == -1 || pid == i))
-        { int c = p_exit[i]; p_state[i] = 0; return c; }
+        if (p_state[i] == S_ZOMBIE && p_ppid[i] == cur_pid
+            && (pid == -1 || pid == i))
+        { int c = p_exit[i]; p_state[i] = S_FREE; return c; }
     return -1;
 }
 
 int send_msg(int dst, int msg)
 {
     int w;
-    if (p_state[dst] != 1 && p_state[dst] != 2) return -1;
+    if (p_state[dst] != S_READY && p_state[dst] != S_BLOCKED
+        && p_state[dst] != S_SLEEP) return -1;
     if (p_msgcnt[dst] >= MSG_Q) return -2;
     w = (p_msgnext[dst] + p_msgcnt[dst]) % MSG_Q;
     p_msgs[dst][w] = msg; p_msgcnt[dst]++;
-    if (p_state[dst] == 2 && p_wait4[dst] == -2) p_state[dst] = 1;
+    if (p_state[dst] == S_BLOCKED && p_wait4[dst] == -2)
+        p_state[dst] = S_READY;
     yield(); return 0;
 }
 
 int recv_msg(int *msg)
 {
     while (p_msgcnt[cur_pid] == 0)
-    { p_wait4[cur_pid] = -2; p_state[cur_pid] = 2; yield(); }
+    { p_wait4[cur_pid] = -2; p_state[cur_pid] = S_BLOCKED; yield(); }
     *msg = p_msgs[cur_pid][p_msgnext[cur_pid]];
     p_msgnext[cur_pid] = (p_msgnext[cur_pid] + 1) % MSG_Q;
     p_msgcnt[cur_pid]--; return 0;
@@ -177,13 +228,26 @@ int pipe_head[MAX_PIPES];
 int pipe_tail[MAX_PIPES];
 int pipe_count[MAX_PIPES];
 int pipe_used[MAX_PIPES];
-int pipe_readers[MAX_PIPES];   /* FD count of read ends */
-int pipe_writers[MAX_PIPES];   /* FD count of write ends */
+int pipe_readers[MAX_PIPES];      /* FD count of read ends */
+int pipe_writers[MAX_PIPES];      /* FD count of write ends */
+int pipe_wait_rd[MAX_PIPES];      /* pid blocked on read, or -1 */
+int pipe_wait_wr[MAX_PIPES];      /* pid blocked on write, or -1 */
 
 void pipe_init(void)
 {
     int i;
-    for (i = 0; i < MAX_PIPES; i++) pipe_used[i] = 0;
+    for (i = 0; i < MAX_PIPES; i++) {
+        pipe_used[i] = 0;
+        pipe_wait_rd[i] = -1;
+        pipe_wait_wr[i] = -1;
+    }
+}
+
+/* Wake a process if it's blocked (on anything). */
+static void wake_if_blocked(int pid)
+{
+    if (pid >= 0 && p_state[pid] == S_BLOCKED)
+        p_state[pid] = S_READY;
 }
 
 int sys_pipe(int fds[2])
@@ -201,6 +265,7 @@ int sys_pipe(int fds[2])
     pipe_used[i] = 1;
     pipe_head[i] = 0; pipe_tail[i] = 0; pipe_count[i] = 0;
     pipe_readers[i] = 1; pipe_writers[i] = 1;
+    pipe_wait_rd[i] = -1; pipe_wait_wr[i] = -1;
 
     fd_type[rfd] = FD_PIPE_RD; fd_pipe[rfd] = i;
     fd_type[wfd] = FD_PIPE_WR; fd_pipe[wfd] = i;
@@ -209,26 +274,61 @@ int sys_pipe(int fds[2])
     return 0;
 }
 
+/* Blocking write: blocks when buffer is full (if readers still exist).
+ * Returns -1 on broken pipe (no readers), or the number of words written. */
 int pipe_write(int pi, int *buf, int words)
 {
-    int i, written, pos;
+    int written, pos;
     written = 0;
     while (written < words) {
-        if (pipe_count[pi] >= PIPE_BUF) break;
+        /* block while buffer full and readers still exist */
+        while (pipe_count[pi] >= PIPE_BUF) {
+            if (pipe_writers[pi] <= 0 || pipe_readers[pi] <= 0)
+                return written > 0 ? written : -1;
+            pipe_wait_wr[pi] = cur_pid;
+            p_state[cur_pid] = S_BLOCKED;
+            yield();
+            /* after wakeup: check if readers went away */
+            if (pipe_readers[pi] <= 0)
+                return written > 0 ? written : -1;
+        }
         pos = (pipe_head[pi] + pipe_count[pi]) % PIPE_BUF;
         pipe_buf[pi][pos] = buf[written++];
         pipe_count[pi]++;
+        /* wake a blocked reader */
+        if (pipe_wait_rd[pi] >= 0) {
+            wake_if_blocked(pipe_wait_rd[pi]);
+            pipe_wait_rd[pi] = -1;
+        }
     }
     return written;
 }
 
+/* Blocking read: blocks when buffer is empty (if writers still exist).
+ * Returns 0 on EOF (no writers and buffer empty), or words read. */
 int pipe_read(int pi, int *buf, int words)
 {
-    int i, nread = 0;
-    while (nread < words && pipe_count[pi] > 0) {
+    int nread = 0;
+    while (nread < words) {
+        /* block while empty and writers still exist */
+        while (pipe_count[pi] == 0) {
+            if (pipe_readers[pi] <= 0 || pipe_writers[pi] <= 0)
+                return nread;   /* EOF */
+            pipe_wait_rd[pi] = cur_pid;
+            p_state[cur_pid] = S_BLOCKED;
+            yield();
+            /* after wakeup: check if writers went away */
+            if (pipe_writers[pi] <= 0 && pipe_count[pi] == 0)
+                return nread;   /* EOF */
+        }
         buf[nread++] = pipe_buf[pi][pipe_tail[pi]];
         pipe_tail[pi] = (pipe_tail[pi] + 1) % PIPE_BUF;
         pipe_count[pi]--;
+        /* wake a blocked writer */
+        if (pipe_wait_wr[pi] >= 0) {
+            wake_if_blocked(pipe_wait_wr[pi]);
+            pipe_wait_wr[pi] = -1;
+        }
     }
     return nread;
 }
@@ -236,6 +336,16 @@ int pipe_read(int pi, int *buf, int words)
 void pipe_close_read(int pi)
 {
     pipe_readers[pi]--;
+    /* wake a writer blocked on full buffer (it will see readers=0 and fail) */
+    if (pipe_wait_wr[pi] >= 0) {
+        wake_if_blocked(pipe_wait_wr[pi]);
+        pipe_wait_wr[pi] = -1;
+    }
+    /* wake a reader blocked on empty (it will see writers=0 and get EOF) */
+    if (pipe_wait_rd[pi] >= 0 && pipe_writers[pi] <= 0) {
+        wake_if_blocked(pipe_wait_rd[pi]);
+        pipe_wait_rd[pi] = -1;
+    }
     if (pipe_readers[pi] <= 0 && pipe_writers[pi] <= 0)
         pipe_used[pi] = 0;
 }
@@ -243,6 +353,16 @@ void pipe_close_read(int pi)
 void pipe_close_write(int pi)
 {
     pipe_writers[pi]--;
+    /* wake a reader blocked on empty (it will see writers=0 and get EOF) */
+    if (pipe_wait_rd[pi] >= 0) {
+        wake_if_blocked(pipe_wait_rd[pi]);
+        pipe_wait_rd[pi] = -1;
+    }
+    /* wake a writer blocked on full (it will see readers=0 and fail) */
+    if (pipe_wait_wr[pi] >= 0 && pipe_readers[pi] <= 0) {
+        wake_if_blocked(pipe_wait_wr[pi]);
+        pipe_wait_wr[pi] = -1;
+    }
     if (pipe_readers[pi] <= 0 && pipe_writers[pi] <= 0)
         pipe_used[pi] = 0;
 }
@@ -541,10 +661,47 @@ int sys_close(int fd)
     return 0;
 }
 
+/* dup2: make newfd refer to the same object as oldfd.
+ * Closes newfd first if it was open.  Returns newfd on success, -1 on error. */
+int sys_dup2(int oldfd, int newfd)
+{
+    int t;
+    if (oldfd < 0 || oldfd >= MAX_FD || fd_type[oldfd] == FD_FREE) return -1;
+    if (newfd < 0 || newfd >= MAX_FD) return -1;
+    if (oldfd == newfd) return newfd;
+    /* close newfd if open */
+    sys_close(newfd);
+    /* copy the FD entry */
+    t = fd_type[oldfd];
+    fd_type[newfd]  = t;
+    fd_ino[newfd]   = fd_ino[oldfd];
+    fd_offset[newfd]= fd_offset[oldfd];
+    fd_pipe[newfd]  = fd_pipe[oldfd];
+    fd_refs[newfd]  = 1;
+    /* bump pipe refcounts so the pipe stays alive */
+    if (t == FD_PIPE_RD) pipe_readers[fd_pipe[oldfd]]++;
+    if (t == FD_PIPE_WR) pipe_writers[fd_pipe[oldfd]]++;
+    return newfd;
+}
+
 /* ================================================================
  *  SHELL
  * ================================================================ */
 int scmp(char *a, char *b) { while (*a && *a == *b) { a++; b++; } return *a - *b; }
+
+/* globals for passing arguments to pipe-segment tasks.
+ * Per-pid arrays because spawns happen before children run,
+ * so the last spawn would otherwise overwrite earlier segments.
+ * Sizes are minimal to keep total memory low (FD table is global,
+ * so memory is shared with the FS). */
+char sh_seg_cmd[MAX_PROCS][16];
+char sh_seg_arg[MAX_PROCS][32];
+int  sh_seg_stdin[MAX_PROCS];    /* fd to dup2 to 0 */
+int  sh_seg_stdout[MAX_PROCS];   /* fd to dup2 to 1 */
+
+/* forward declarations */
+void sh_pipe_segment_task(void);
+int  sh_exec_cmd(char *cmd, char *arg);
 
 void sh_readln(char *buf, int max)
 {
@@ -572,30 +729,37 @@ void sh_readln(char *buf, int max)
 
 void sh_cat(char *path)
 {
-    int fd, buf[64], n, i;
-    fd = sys_open(path);
-    if (fd < 0) { puts("not found"); return; }
-    while ((n = sys_read(fd, buf, 64)) > 0)
-        for (i = 0; i < n; i++) putchar(buf[i]);
-    putchar('\n');
-    sys_close(fd);
+    int fd, buf[32], n, i;
+    if (path[0] == 0) {
+        fd = 0;   /* no path → read stdin (useful for pipes) */
+    } else {
+        fd = sys_open(path);
+        if (fd < 0) { puts("not found"); return; }
+    }
+    while ((n = sys_read(fd, buf, 32)) > 0)
+        sys_write(1, buf, n);      /* write to stdout (may be a pipe) */
+    sys_write(1, "\n", 1);
+    if (fd != 0) sys_close(fd);
 }
 
 void sh_ps(void)
 {
-    int i; char *sts = "?RBZ";
-    puts("PID PPID ST NAME");
+    int i; char *sts = "?RBZS";
+    puts("PID PPID PR ST NAME");
     for (i = 0; i < MAX_PROCS; i++) if (p_state[i]) {
-        printf(" %d   %d   %c  ", i, p_ppid[i], sts[p_state[i]]);
+        printf(" %d   %d   %d  %c  ",
+               i, p_ppid[i], p_priority[i], sts[p_state[i]]);
         { int j; for (j = 0; j < 4 && p_name[i][j]; j++) putchar(p_name[i][j]); }
         putchar('\n');
     }
 }
 
+void prio_demo_task(void);
+
 void shell_task(void)
 {
     char line[64], cmd[32], arg[64];
-    int c, i, fd, fds[2], pid, buf[256], n;
+    int i, c;
 
     puts("RISKY OS v3 shell.  Type 'help'.");
 
@@ -608,6 +772,17 @@ void shell_task(void)
         }
         putchar('\n');
 
+        /* check for pipe */
+        {
+            char *p = line;
+            while (*p && *p != '|') p++;
+            if (*p == '|') {
+                sh_run_pipeline(line);
+                yield();
+                continue;
+            }
+        }
+
         /* parse cmd and arg */
         for (i = 0; line[i] == ' ' || line[i] == '\t'; i++);
         { int j; for (j = 0; line[i] && line[i] != ' ' && line[i] != '\t' && j < 31; i++, j++)
@@ -618,74 +793,229 @@ void shell_task(void)
 
         if (cmd[0] == 0) { yield(); continue; }
 
-        if (scmp(cmd, "help") == 0) {
-            puts("help ps ls cat mkfile mkdir pipe write exit");
-        } else if (scmp(cmd, "ps") == 0) {
-            sh_ps();
-        } else if (scmp(cmd, "ls") == 0) {
-            if (arg[0]) { fs_dir_list(fs_resolve(arg)); putchar('\n'); }
-            else { fs_dir_list(0); putchar('\n'); }
-        } else if (scmp(cmd, "cat") == 0) {
-            sh_cat(arg);
-        } else if (scmp(cmd, "mkfile") == 0 || scmp(cmd, "mkdir") == 0) {
-            /* Parse path: split into parent dir and name.
-             * "/logs/boot" → parent = /logs, name = "boot"
-             * "/hello"     → parent = /,     name = "hello"
-             * "hello"      → parent = /,     name = "hello"  (no /, implicit root) */
-            int parent, type, ino;
-            char *p, *name, *slash;
-            p = arg;
-            name = arg;
-            slash = arg;
-            /* find last '/' */
-            while (*p) { if (*p == '/') slash = p; p++; }
-            if (*name == '/' && slash == name) {
-                parent = 0; name++;             /* "/name" */
-            } else if (*name == '/') {
-                *slash = 0; parent = fs_resolve(name); *slash = '/'; name = slash + 1;
-            } else {
-                parent = 0;                     /* "name" — implicit root */
-            }
-            type = (cmd[0] == 'm' && cmd[2] == 'f') ? 1 : 2;  /* mkfile→1, mkdir→2 */
-            ino = fs_ialloc(type, name);
-            if (ino >= 0 && parent >= 0 && fs_type[parent] == 2) {
-                fs_dir_add(parent, name, ino);
-                printf("created %s %s (ino %d)\n", type==2?"dir":"file", name, ino);
-            } else {
-                puts("create failed");
-            }
-        } else if (scmp(cmd, "write") == 0) {
-            /* write <path> <text> */
-            char *path, *text;
-            path = arg;
-            for (text = arg; *text && *text != ' '; text++);
-            if (*text) { *text = 0; text++; }
-            fd = sys_open(path);
-            if (fd >= 0) {
-                for (i = 0; text[i]; i++) buf[i] = text[i];
-                sys_write(fd, buf, i);
-                sys_close(fd);
-                printf("wrote %d bytes to %s\n", i, path);
-            } else {
-                puts("open failed");
-            }
-        } else if (scmp(cmd, "pipe") == 0) {
-            if (sys_pipe(fds) == 0)
-                printf("pipe: rd=%d wr=%d\n", fds[0], fds[1]);
-            else
-                puts("pipe failed");
-        } else if (scmp(cmd, "echo") == 0) {
-            puts(arg);
-        } else if (scmp(cmd, "spawn") == 0) {
-            pid = proc_spawn(shell_task, cur_pid, "sh2");
-            printf("spawned %d\n", pid);
-        } else if (scmp(cmd, "exit") == 0) {
-            puts("bye.");
-            proc_exit(0);
-        } else {
-            printf("?: %s\n", cmd);
-        }
+        sh_exec_cmd(cmd, arg);
         yield();
+    }
+}
+
+/* Execute a single builtin command (no pipes). */
+int sh_exec_cmd(char *cmd, char *arg)
+{
+    int i, fd, fds[2], pid, buf[128];
+
+    if (scmp(cmd, "help") == 0) {
+        puts("help ps ls cat mkfile mkdir pipe write echo nice sleep prio exit");
+    } else if (scmp(cmd, "ps") == 0) {
+        sh_ps();
+    } else if (scmp(cmd, "ls") == 0) {
+        if (arg[0]) { fs_dir_list(fs_resolve(arg)); putchar('\n'); }
+        else { fs_dir_list(0); putchar('\n'); }
+    } else if (scmp(cmd, "cat") == 0) {
+        sh_cat(arg);
+    } else if (scmp(cmd, "mkfile") == 0 || scmp(cmd, "mkdir") == 0) {
+        int parent, type, ino;
+        char *p, *name, *slash;
+        p = arg; name = arg; slash = arg;
+        while (*p) { if (*p == '/') slash = p; p++; }
+        if (*name == '/' && slash == name) {
+            parent = 0; name++;
+        } else if (*name == '/') {
+            *slash = 0; parent = fs_resolve(name); *slash = '/'; name = slash + 1;
+        } else {
+            parent = 0;
+        }
+        type = (cmd[0] == 'm' && cmd[2] == 'f') ? 1 : 2;
+        ino = fs_ialloc(type, name);
+        if (ino >= 0 && parent >= 0 && fs_type[parent] == 2) {
+            fs_dir_add(parent, name, ino);
+            printf("created %s %s (ino %d)\n", type==2?"dir":"file", name, ino);
+        } else {
+            puts("create failed");
+        }
+    } else if (scmp(cmd, "write") == 0) {
+        char *path, *text;
+        path = arg;
+        for (text = arg; *text && *text != ' '; text++);
+        if (*text) { *text = 0; text++; }
+        fd = sys_open(path);
+        if (fd >= 0) {
+            for (i = 0; text[i]; i++) buf[i] = text[i];
+            sys_write(fd, buf, i);
+            sys_close(fd);
+            printf("wrote %d bytes to %s\n", i, path);
+        } else {
+            puts("open failed");
+        }
+    } else if (scmp(cmd, "pipe") == 0) {
+        if (sys_pipe(fds) == 0)
+            printf("pipe: rd=%d wr=%d\n", fds[0], fds[1]);
+        else
+            puts("pipe failed");
+    } else if (scmp(cmd, "echo") == 0) {
+        /* write to stdout (fd 1) so pipe redirection works */
+        int elen;
+        for (elen = 0; arg[elen]; elen++);
+        sys_write(1, arg, elen);
+        sys_write(1, "\n", 1);
+    } else if (scmp(cmd, "spawn") == 0) {
+        pid = proc_spawn(shell_task, cur_pid, "sh2");
+        printf("spawned %d\n", pid);
+    } else if (scmp(cmd, "nice") == 0) {
+        int tgt, prio; char *ap;
+        tgt = 0; prio = 0;
+        ap = arg;
+        while (*ap >= '0' && *ap <= '9') { tgt = tgt * 10 + (*ap - '0'); ap++; }
+        while (*ap == ' ') ap++;
+        while (*ap >= '0' && *ap <= '9') { prio = prio * 10 + (*ap - '0'); ap++; }
+        if (tgt > 0 && tgt < MAX_PROCS && p_state[tgt]) {
+            p_priority[tgt] = prio;
+            printf("pid %d priority = %d\n", tgt, prio);
+        } else {
+            puts("invalid pid");
+        }
+    } else if (scmp(cmd, "sleep") == 0) {
+        int ticks; char *ap2;
+        ticks = 0;
+        ap2 = arg;
+        while (*ap2 >= '0' && *ap2 <= '9') { ticks = ticks * 10 + (*ap2 - '0'); ap2++; }
+        if (ticks > 0) {
+            printf("sleeping %d ticks...\n", ticks);
+            proc_sleep(ticks);
+            printf("awake at tick %d\n", sys_tick);
+        }
+    } else if (scmp(cmd, "prio") == 0) {
+        pid = proc_spawn(prio_demo_task, cur_pid, "prio");
+        printf("spawned prio demo pid %d\n", pid);
+    } else if (scmp(cmd, "exit") == 0) {
+        puts("bye.");
+        proc_exit(0);
+    } else {
+        printf("?: %s\n", cmd);
+    }
+    return 0;
+}
+
+/* ---- pipe support ---- */
+
+/* Task entry point for a pipe segment: redirect FDs, exec command, exit.
+ * The FD table is global — we must be careful not to close pipe ends
+ * that other segments still need.  Segments run in pipeline order
+ * (enforced by priority) so that a writer finishes before its reader.
+ *
+ * After execution we restore fd 1 to the terminal (dup2 from stderr)
+ * rather than closing it, so the fd-1 slot stays valid for the next
+ * segment / the shell.  This also correctly decrements pipe_writers. */
+void sh_pipe_segment_task(void)
+{
+    int my_pid = cur_pid;
+    char *cmd = sh_seg_cmd[my_pid];
+    char *arg = sh_seg_arg[my_pid];
+    int in_fd  = sh_seg_stdin[my_pid];
+    int out_fd = sh_seg_stdout[my_pid];
+
+    /* redirect stdin */
+    if (in_fd >= 0 && in_fd != 0) {
+        sys_dup2(in_fd, 0);
+        sys_close(in_fd);
+    }
+    /* redirect stdout */
+    if (out_fd >= 0 && out_fd != 1) {
+        sys_dup2(out_fd, 1);
+        sys_close(out_fd);
+    }
+
+    sh_exec_cmd(cmd, arg);
+
+    /* Release pipe ends we hold via fd 0 / fd 1.  For the write-end we
+     * dup2 stderr (terminal) to fd 1 so the slot stays valid; for the
+     * read-end a simple close is fine since we are exiting. */
+    if (fd_type[1] == FD_PIPE_WR) {
+        sys_dup2(2, 1);    /* restore fd 1 → terminal, drops pipe_writers */
+    }
+    if (fd_type[0] == FD_PIPE_RD) {
+        sys_close(0);      /* drop pipe_readers (fd 0 slot won't be reused) */
+    }
+    proc_exit(0);
+}
+
+/* Run a pipeline (up to 4 segments separated by |). */
+void sh_run_pipeline(char *line)
+{
+    char *segs[4];
+    int pipes[3][2];    /* pipes between segments: up to 3 */
+    int pids[4];
+    int nseg, i, j, k;
+
+    /* ---- split line into segments ---- */
+    nseg = 0;
+    segs[nseg++] = line;
+    for (i = 0; line[i] && nseg < 4; i++) {
+        if (line[i] == '|') {
+            line[i] = 0;
+            segs[nseg++] = line + i + 1;
+        }
+    }
+    if (nseg < 2) return;
+
+    /* ---- create pipes ---- */
+    for (i = 0; i < nseg - 1; i++) {
+        if (sys_pipe(pipes[i]) < 0) {
+            puts("pipe failed");
+            for (j = 0; j < i; j++) {
+                sys_close(pipes[j][0]);
+                sys_close(pipes[j][1]);
+            }
+            return;
+        }
+    }
+
+    /* ---- spawn each segment ---- */
+    for (i = 0; i < nseg; i++) {
+        char *s = segs[i];
+        char tcmd[16], targ[32];
+        int pid, in, out;
+
+        while (*s == ' ' || *s == '\t') s++;
+
+        for (j = 0; s[j] && s[j] != ' ' && s[j] != '\t' && j < 15; j++)
+            tcmd[j] = s[j];
+        tcmd[j] = 0;
+        while (s[j] == ' ' || s[j] == '\t') j++;
+        for (k = 0; s[j + k] && k < 31; k++)
+            targ[k] = s[j + k];
+        targ[k] = 0;
+
+        pid = proc_spawn(sh_pipe_segment_task, cur_pid, "pip");
+        pids[i] = pid;
+        if (pid >= 0) {
+            in  = (i > 0)       ? pipes[i-1][0] : 0;
+            out = (i < nseg-1)  ? pipes[i][1]   : 1;
+            /* copy into the child's per-pid slot */
+            for (k = 0; tcmd[k]; k++)
+                sh_seg_cmd[pid][k] = tcmd[k];
+            sh_seg_cmd[pid][k] = 0;
+            for (k = 0; targ[k]; k++)
+                sh_seg_arg[pid][k] = targ[k];
+            sh_seg_arg[pid][k] = 0;
+            sh_seg_stdin[pid]  = in;
+            sh_seg_stdout[pid] = out;
+            p_priority[pid] = 100 - i;  /* writer-before-reader order */
+        } else {
+            puts("spawn failed");
+            break;
+        }
+    }
+
+    /* ---- wait for all children (yields; priority ordering ensures
+     *      segment 0 runs first, then segment 1, etc.) ---- */
+    for (i = 0; i < nseg; i++)
+        if (pids[i] >= 0)
+            proc_wait(pids[i]);
+
+    /* ---- parent cleans up any remaining pipe FDs ---- */
+    for (i = 0; i < nseg - 1; i++) {
+        if (fd_type[pipes[i][0]] != FD_FREE) sys_close(pipes[i][0]);
+        if (fd_type[pipes[i][1]] != FD_FREE) sys_close(pipes[i][1]);
     }
 }
 
@@ -711,6 +1041,43 @@ void pipe_demo_task(void)
     for (i = 0; i < n; i++) putchar(buf[i]);
     putchar('\n');
 
+    proc_exit(0);
+}
+
+/* ================================================================
+ *  PRIORITY DEMO: 3 tasks at priorities 0, 1, 2 each print a char
+ * ================================================================ */
+void prio_worker_task(void)
+{
+    /* pid is passed via the stack frame (see proc_spawn).
+     * We grab the priority and print a distinct marker. */
+    int my_prio, i;
+    char marker;
+    my_prio = p_priority[cur_pid];
+    marker = '0' + my_prio;   /* '0', '1', or '2' */
+    for (i = 0; i < 8; i++) {
+        putchar(marker);
+        proc_sleep(10);        /* let others run */
+    }
+    proc_exit(0);
+}
+
+void prio_demo_task(void)
+{
+    int lo, mid, hi;
+    /* spawn 3 workers at different priorities */
+    lo  = proc_spawn(prio_worker_task, cur_pid, "wk0");
+    mid = proc_spawn(prio_worker_task, cur_pid, "wk1");
+    hi  = proc_spawn(prio_worker_task, cur_pid, "wk2");
+    p_priority[lo]  = 0;
+    p_priority[mid] = 5;
+    p_priority[hi]  = 9;
+    printf("prio demo: lo=%d(p=0) mid=%d(p=5) hi=%d(p=9)\n", lo, mid, hi);
+    putchar('[');
+    proc_wait(-1);  /* wait for all 3 (they all exit) */
+    proc_wait(-1);
+    proc_wait(-1);
+    puts("] done");
     proc_exit(0);
 }
 
@@ -752,13 +1119,15 @@ int main(void)
 {
     int i, alive, code;
 
-    for (i = 0; i < MAX_PROCS; i++) p_state[i] = 0;
+    for (i = 0; i < MAX_PROCS; i++) p_state[i] = S_FREE;
     fd_init();
     pipe_init();
     fs_init_simple();
     fs_populate();
+    sys_tick = 0;
 
-    p_state[0] = 1; p_ppid[0] = -1; p_exit[0] = 0;
+    p_state[0] = S_READY; p_ppid[0] = -1; p_exit[0] = 0;
+    p_priority[0] = 0; p_sleep_until[0] = 0;
     p_name[0][0] = 'i'; p_name[0][1] = 'n'; p_name[0][2] = 'i'; p_name[0][3] = 't';
     cur_pid = 0;
 
@@ -769,20 +1138,21 @@ int main(void)
     while (1) {
         alive = 0;
         for (i = 1; i < MAX_PROCS; i++)
-            if (p_state[i] == 1 || p_state[i] == 2) alive = 1;
+            if (p_state[i] == S_READY || p_state[i] == S_BLOCKED
+                || p_state[i] == S_SLEEP) alive = 1;
         if (!alive) {
             for (i = 1; i < MAX_PROCS; i++)
-                if (p_state[i] == 3) {
+                if (p_state[i] == S_ZOMBIE) {
                     printf("[%d exited: %d]\n", i, p_exit[i]);
-                    p_state[i] = 0;
+                    p_state[i] = S_FREE;
                 }
             break;
         }
         code = proc_wait(-1);
         for (i = 1; i < MAX_PROCS; i++)
-            if (p_state[i] == 3) {
+            if (p_state[i] == S_ZOMBIE) {
                 printf("[%d exited: %d]\n", i, code);
-                p_state[i] = 0;
+                p_state[i] = S_FREE;
             }
     }
 
