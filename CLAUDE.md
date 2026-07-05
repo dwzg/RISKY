@@ -34,7 +34,7 @@ Full ISA is in `docs/isa.txt`. Key hardware behaviors that differ from C expecta
 
 ### Compiler (`risky_c.py`, ~3100 lines)
 
-Single-pass design: regex lexer → recursive-descent parser → AST classes with `generate()` methods that emit RISKY assembly text. No intermediate representation, no optimization passes.
+Single-pass design: regex lexer → recursive-descent parser → AST classes with `generate()` methods that emit RISKY assembly text. No intermediate representation; after generation a peephole optimizer rewrites the assembly text (see below).
 
 **Key classes:**
 - `Preprocessor` — handles `#include`/`#define`/`#if` before lexing, produces a flat token stream
@@ -45,6 +45,8 @@ Single-pass design: regex lexer → recursive-descent parser → AST classes wit
 **Startup code** initializes page to 0, sp to 0xffff, writes global/string initializers into RAM, calls `main`, then jumps to `__halt: jmp __halt` (simulator detects this jump-to-self as termination).
 
 **Dead code elimination:** after generation, functions not reachable from main are stripped (`--keep-dead` disables).
+
+**Peephole optimizer:** after dead-code elimination, `peephole()` iterates local rewrite rules on the assembly text to a fixed point (`--no-opt` disables): push/pop elimination, immediate-operand folding (`push r0; in r0,#5; pop r1; add r0,r1,r0` → `addi r0,#5`), compare-and-branch fusion (the `mov r0,state; andi; shri; cmp; jeq` idiom → one conditional jump), jump threading, jump-to-next and unreachable-code removal. Rewrite windows never cross labels, and register/flag liveness is answered by a conservative forward scan (`_regsDeadFrom`) that follows direct jumps and calls and assumes "live" for anything it cannot see through, so handwritten `__asm__`/`__naked` code is only transformed when provably safe. `call`-idiom jumps (`ldpc/addi/push/jmp`) are recognized so the return-address arithmetic is never broken.
 
 **`__naked` functions:** skip the C prologue/epilogue (no `push r15; mov r15,sp` / epilogue). Body must be pure `__asm__`. Used for context-switch routines in the OS.
 
