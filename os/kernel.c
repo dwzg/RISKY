@@ -375,35 +375,127 @@ void pipe_close_write(int pi)
 #define FS_DIRECT   8
 #define FS_BLKSZ    256
 
-/* inode (in page 0 RAM) */
-int  fs_type[FS_INODES];     /* 0=free 1=file 2=dir */
-long fs_size[FS_INODES];
-int  fs_blocks[FS_INODES][FS_DIRECT];  /* page:addr encoded */
-char fs_name[FS_INODES][FS_NAMELEN];
+/*
+ * Multi-page storage:
+ *   Block pointers are 32-bit (long): (page << 16) | addr.
+ *   Pages 1-7 hold file data, page 0 holds inode metadata.
+ *   A free-block bitmap tracks 1792 blocks across pages 1-7.
+ *
+ * CRITICAL: SP and PAGE share the RAM address bus.  Never touch the
+ * stack (push/pop/call/ret) while page != 0.  Cross-page access uses
+ * single ldr/stor instructions with page save/restore in registers.
+ * All parameter loads from the stack MUST happen before the page switch.
+ */
 
-/* block allocator: track free blocks across pages 1-7.
- * Simple: pages 1-7, blocks numbered 0..7167 (7*64K/256 = 7*256 = 1792,
- * but we store per-page bitmaps).  Keep it simple: next free block counter. */
-int fs_next_page;
-int fs_next_addr;
+/* ---- cross-page access primitives ----
+ * Use fixed address 0x7FF4 as a one-word transfer register, just
+ * after the context-switch bridge (0x7FF0-0x7FF3) and below the
+ * heap (0x8000). */
+#define PAGE_TMP (*(int *)0x7FF4)
 
-/* File data in page 0, starting at 0x8000.
- * Each inode gets up to FS_DIRECT blocks of FS_BLKSZ words.
- * Block pointer is a byte offset from 0x8000. */
-#define FS_DATA_BASE 0x8000
-
-int fs_alloc_block_simple(void)
+static int page_rd(int page, int addr)
 {
-    static int next_blk = FS_BLKSZ;    /* 256 = first block; 0 = unallocated */
-    int blk = next_blk;
-    next_blk += FS_BLKSZ;
-    if (next_blk > 0x7000) return -1;  /* 28K of file data in page 0 */
-    return blk;
+    /* params: page at r15+3, addr at r15+4.
+     * ALL parameter loads happen BEFORE the page switch. */
+    if (page == 0) return *((int *)addr);
+    __asm__("\n\tmov r2,page"         /* save current page */
+            "\n\tldo r0,*r15,#3"      /* r0 = target page */
+            "\n\tldo r1,*r15,#4"      /* r1 = addr (before page switch!) */
+            "\n\tmov page,r0"         /* switch page */
+            "\n\tldr r0,*r1"          /* r0 = mem[addr] */
+            "\n\tmov page,r2"         /* restore page */
+            "\n\tstod *0x7FF4,r0");   /* store result at PAGE_TMP */
+    return PAGE_TMP;
 }
 
+static void page_wr(int page, int addr, int value)
+{
+    /* params: page at r15+3, addr at r15+4, value at r15+5.
+     * ALL parameter loads happen BEFORE the page switch. */
+    if (page == 0) { *((int *)addr) = value; return; }
+    PAGE_TMP = value;
+    __asm__("\n\tmov r2,page"         /* save current page */
+            "\n\tldo r0,*r15,#3"      /* r0 = target page */
+            "\n\tldo r1,*r15,#4"      /* r1 = addr (before page switch!) */
+            "\n\tldd r3,*0x7FF4"      /* r3 = value (before page switch!) */
+            "\n\tmov page,r0"         /* switch page */
+            "\n\tstor *r1,r3"         /* mem[addr] = value */
+            "\n\tmov page,r2");       /* restore page */
+}
+
+/* ---- block pointer encoding ----
+ * 32-bit block pointer: (page << 16) | addr
+ * page 0 = unallocated/in-page-0, pages 1-7 = data pages */
+#define BLK_PAGE(bp)  ((int)((bp) >> 16))
+#define BLK_ADDR(bp)  ((int)((bp) & 0xFFFF))
+#define BLK_PTR(p,a)  (((long)(p) << 16) | (long)((a) & 0xFFFF))
+
+/* ---- inode (in page 0 RAM) ---- */
+int  fs_type[FS_INODES];     /* 0=free 1=file 2=dir */
+long fs_size[FS_INODES];
+long fs_blocks[FS_INODES][FS_DIRECT];  /* 32-bit block pointers */
+char fs_name[FS_INODES][FS_NAMELEN];
+
+/* ---- free-block bitmap (pages 1-7, 256-word blocks) ----
+ * 7 pages * (65536 / 256) = 7 * 256 = 1792 blocks.
+ * 1792 bits = 112 words. */
+#define FS_NBLOCKS  1792
+#define FS_BMP_WORDS 112
+static int fs_blkmap[FS_BMP_WORDS];
+
+/* block index -> (page, addr) */
+#define FS_BLK_PAGE(idx)  (1 + (idx) / 256)
+#define FS_BLK_ADDR(idx)  (((idx) % 256) * FS_BLKSZ)
+
+static int fs_blkmap_get(int idx)
+{
+    return (fs_blkmap[idx / 16] >> (idx % 16)) & 1;
+}
+
+static void fs_blkmap_set(int idx, int val)
+{
+    int w, b;
+    w = idx / 16; b = idx % 16;
+    if (val)
+        fs_blkmap[w] |= (1 << b);
+    else
+        fs_blkmap[w] &= ~(1 << b);
+}
+
+static void fs_blkmap_init(void)
+{
+    int i;
+    for (i = 0; i < FS_BMP_WORDS; i++) fs_blkmap[i] = 0;
+}
+
+static long fs_alloc_block(void)
+{
+    int i;
+    for (i = 0; i < FS_NBLOCKS; i++) {
+        if (fs_blkmap_get(i) == 0) {
+            fs_blkmap_set(i, 1);
+            return BLK_PTR(FS_BLK_PAGE(i), FS_BLK_ADDR(i));
+        }
+    }
+    return 0;   /* no free blocks */
+}
+
+static void fs_free_block(long blk_ptr)
+{
+    int page, addr, idx;
+    page = BLK_PAGE(blk_ptr);
+    addr = BLK_ADDR(blk_ptr);
+    if (page < 1 || page > 7) return;
+    idx = (page - 1) * 256 + (addr / FS_BLKSZ);
+    if (idx >= 0 && idx < FS_NBLOCKS)
+        fs_blkmap_set(idx, 0);
+}
+
+/* ---- FS init ---- */
 void fs_init_simple(void)
 {
     int i, j;
+    fs_blkmap_init();
     for (i = 0; i < FS_INODES; i++) {
         fs_type[i] = 0; fs_size[i] = 0;
         fs_name[i][0] = 0;
@@ -432,14 +524,17 @@ int fs_ialloc(int type, char *name)
 
 int fs_grow(int ino, int newsize)
 {
-    int cur_blocks, need_blocks, i, blk;
+    int cur_blocks, need_blocks, i;
+    long blk;
     if (ino < 0 || ino >= FS_INODES || fs_type[ino] == 0) return -1;
-    cur_blocks = (fs_size[ino] + FS_BLKSZ - 1) / FS_BLKSZ;
+    cur_blocks = (int)((fs_size[ino] + FS_BLKSZ - 1) / FS_BLKSZ);
     need_blocks = (newsize + FS_BLKSZ - 1) / FS_BLKSZ;
     for (i = cur_blocks; i < need_blocks && i < FS_DIRECT; i++) {
-        blk = fs_alloc_block_simple();
-        if (blk < 0) return -1;
-        fs_blocks[ino][i] = blk;
+        if (fs_blocks[ino][i] == 0) {
+            blk = fs_alloc_block();
+            if (blk == 0) return -1;
+            fs_blocks[ino][i] = blk;
+        }
     }
     if (newsize > fs_size[ino]) fs_size[ino] = newsize;
     return 0;
@@ -447,58 +542,71 @@ int fs_grow(int ino, int newsize)
 
 int fs_writei(int ino, int offset, int *buf, int words)
 {
-    int i, blk_idx, blk_off, blk, addr, *dst;
+    int i, blk_idx, blk_off, page, addr;
+    long blk;
     if (fs_grow(ino, offset + words) < 0) return -1;
     for (i = 0; i < words; i++) {
         blk_idx = (offset + i) / FS_BLKSZ;
         blk_off = (offset + i) % FS_BLKSZ;
         if (blk_idx >= FS_DIRECT) break;
         blk = fs_blocks[ino][blk_idx];
-        addr = FS_DATA_BASE + blk + blk_off;
-        dst = (int *) addr;
-        *dst = buf[i];
+        if (blk == 0) break;
+        page = BLK_PAGE(blk);
+        addr = BLK_ADDR(blk) + blk_off;
+        if (page == 0)
+            *((int *)addr) = buf[i];
+        else
+            page_wr(page, addr, buf[i]);
     }
     return i;
 }
 
-/* Write string to inode — simple version */
+/* Write string to inode */
 int fs_write_str(int ino, char *s)
 {
-    int i, blk_idx, blk, addr;
-    int *dst;
+    int i, blk_idx, blk_off, page, addr;
+    long blk;
     for (i = 0; s[i]; i++) {
         if (i >= fs_size[ino]) {
-            /* grow */
             blk_idx = i / FS_BLKSZ;
             if (blk_idx >= FS_DIRECT) return i;
             if (fs_blocks[ino][blk_idx] == 0) {
-                int nb = fs_alloc_block_simple();
-                if (nb < 0) return i;
+                long nb = fs_alloc_block();
+                if (nb == 0) return i;
                 fs_blocks[ino][blk_idx] = nb;
             }
             fs_size[ino] = i + 1;
         }
         blk_idx = i / FS_BLKSZ;
         blk = fs_blocks[ino][blk_idx];
-        addr = FS_DATA_BASE + blk + (i % FS_BLKSZ);
-        dst = (int *) addr;
-        *dst = s[i];
+        blk_off = i % FS_BLKSZ;
+        page = BLK_PAGE(blk);
+        addr = BLK_ADDR(blk) + blk_off;
+        if (page == 0)
+            *((int *)addr) = s[i];
+        else
+            page_wr(page, addr, s[i]);
     }
     return i;
 }
 
 int fs_readi(int ino, int offset, int *buf, int words)
 {
-    int i, blk_idx, blk, addr, *src;
+    int i, blk_idx, blk_off, page, addr;
+    long blk;
     if (ino < 0 || ino >= FS_INODES || fs_type[ino] == 0) return -1;
-    for (i = 0; i < words && offset + i < fs_size[ino]; i++) {
+    for (i = 0; i < words && offset + i < (int)fs_size[ino]; i++) {
         blk_idx = (offset + i) / FS_BLKSZ;
         if (blk_idx >= FS_DIRECT) break;
         blk = fs_blocks[ino][blk_idx];
         if (blk == 0) break;
-        addr = FS_DATA_BASE + blk + ((offset + i) % FS_BLKSZ);
-        src = (int *) addr;
-        buf[i] = *src;
+        blk_off = (offset + i) % FS_BLKSZ;
+        page = BLK_PAGE(blk);
+        addr = BLK_ADDR(blk) + blk_off;
+        if (page == 0)
+            buf[i] = *((int *)addr);
+        else
+            buf[i] = page_rd(page, addr);
     }
     return i;
 }
@@ -559,6 +667,87 @@ void fs_dir_list(int dir_ino)
         }
         pos += nlen;
     }
+}
+
+/* ---- file deletion ---- */
+
+/* Remove a directory entry by setting its inode to -1. */
+int fs_dir_remove(int dir_ino, char *name)
+{
+    int pos, ino, nlen, j, slen, match, minus_one;
+    slen = strlen(name);
+    pos = 0;
+    while (pos < fs_size[dir_ino]) {
+        fs_readi(dir_ino, pos, &ino, 1); pos++;
+        fs_readi(dir_ino, pos, &nlen, 1); pos++;
+        if (ino != -1 && nlen == slen) {
+            match = 1;
+            for (j = 0; j < nlen; j++) {
+                int ch; fs_readi(dir_ino, pos + j, &ch, 1);
+                if (ch != name[j]) { match = 0; break; }
+            }
+            if (match) {
+                minus_one = -1;
+                fs_writei(dir_ino, pos - 2, &minus_one, 1);
+                return 0;
+            }
+        }
+        pos += nlen;
+    }
+    return -1;
+}
+
+/* Delete a file by path. Frees all data blocks and the inode. */
+int fs_unlink(char *path)
+{
+    int parent, ino, i, slash_pos;
+    char name[32];
+    long blk;
+
+    if (path[0] != '/') return -1;
+
+    /* find the last '/' to split dirname / basename */
+    slash_pos = 0;
+    for (i = 0; path[i]; i++)
+        if (path[i] == '/') slash_pos = i;
+
+    if (slash_pos == 0) {
+        parent = 0;
+        for (i = 0; i < 31 && path[i+1]; i++)
+            name[i] = path[i+1];
+        name[i] = 0;
+    } else {
+        for (i = 0; i < slash_pos; i++)
+            name[i] = path[i];
+        name[slash_pos] = 0;
+        parent = fs_resolve(name);
+        for (i = 0; i < 31 && path[slash_pos+1+i]; i++)
+            name[i] = path[slash_pos+1+i];
+        name[i] = 0;
+    }
+
+    if (parent < 0) return -1;
+    if (parent == 0 && name[0] == 0) return -1;
+
+    ino = fs_dir_lookup(parent, name);
+    if (ino < 0 || fs_type[ino] != 1) return -1;
+
+    /* free data blocks */
+    for (i = 0; i < FS_DIRECT; i++) {
+        blk = fs_blocks[ino][i];
+        if (blk != 0) {
+            fs_free_block(blk);
+            fs_blocks[ino][i] = 0;
+        }
+    }
+
+    /* remove directory entry and free inode */
+    fs_dir_remove(parent, name);
+    fs_type[ino] = 0;
+    fs_size[ino] = 0;
+    fs_name[ino][0] = 0;
+
+    return 0;
 }
 
 /* ---- path resolution ---- */
@@ -682,6 +871,11 @@ int sys_dup2(int oldfd, int newfd)
     if (t == FD_PIPE_RD) pipe_readers[fd_pipe[oldfd]]++;
     if (t == FD_PIPE_WR) pipe_writers[fd_pipe[oldfd]]++;
     return newfd;
+}
+
+int sys_unlink(char *path)
+{
+    return fs_unlink(path);
 }
 
 /* ================================================================
@@ -842,7 +1036,7 @@ int sh_exec_cmd(char *cmd, char *arg)
     int fd, fds[2], pid;
 
     if (scmp(cmd, "help") == 0) {
-        puts("help ps ls cat mkfile mkdir pipe write echo nice sleep prio exit");
+        puts("help ps ls cat mkfile mkdir rm pipe write echo nice sleep prio exit");
     } else if (scmp(cmd, "ps") == 0) {
         sh_ps();
     } else if (scmp(cmd, "ls") == 0) {
@@ -927,6 +1121,9 @@ int sh_exec_cmd(char *cmd, char *arg)
     } else if (scmp(cmd, "prio") == 0) {
         pid = proc_spawn(prio_demo_task, cur_pid, "prio");
         printf("spawned prio demo pid %d\n", pid);
+    } else if (scmp(cmd, "rm") == 0) {
+        if (arg[0] == 0) { puts("rm: missing path"); }
+        else if (sys_unlink(arg) < 0) { puts("rm: failed"); }
     } else if (scmp(cmd, "exit") == 0) {
         puts("bye.");
         proc_exit(0);
