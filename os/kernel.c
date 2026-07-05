@@ -969,6 +969,7 @@ void sh_ps(void)
 void prio_demo_task(void);
 
 void sh_run_pipeline(char *line);
+void editor_task(char *path);
 void shell_task(void)
 {
     char line[64], cmd[32], arg[64];
@@ -1128,6 +1129,8 @@ int sh_exec_cmd(char *cmd, char *arg)
     } else if (scmp(cmd, "rm") == 0) {
         if (arg[0] == 0) { puts("rm: missing path"); }
         else if (sys_unlink(arg) < 0) { puts("rm: failed"); }
+    } else if (scmp(cmd, "edit") == 0) {
+        editor_task(arg);
     } else if (scmp(cmd, "exit") == 0) {
         puts("bye.");
         proc_exit(0);
@@ -1278,6 +1281,284 @@ void sh_run_pipeline(char *line)
     for (i = 0; i < nseg - 1; i++) {
         if (fd_type[pipes[i][0]] != FD_FREE) sys_close(pipes[i][0]);
         if (fd_type[pipes[i][1]] != FD_FREE) sys_close(pipes[i][1]);
+    }
+}
+
+/* ================================================================
+ *  TEXT EDITOR
+ * ================================================================ */
+#define EDIT_BUF_SIZE 2048
+#define EDIT_MAX_LINES 128
+
+static char edit_buf[EDIT_BUF_SIZE];
+static int  edit_len;
+static int  edit_lines[EDIT_MAX_LINES];
+static int  edit_nlines;
+static char edit_path[32];
+
+/* Rebuild the line-index from the text buffer.
+ * edit_lines[i] = offset of line i in edit_buf.
+ * A line is text up to (but not including) the next '\n'. */
+static void edit_reindex(void)
+{
+    int i;
+    edit_nlines = 0;
+    if (edit_len > 0)
+        edit_lines[edit_nlines++] = 0;
+    for (i = 0; i < edit_len && edit_nlines < EDIT_MAX_LINES; i++) {
+        if (edit_buf[i] == '\n' && i + 1 < edit_len)
+            edit_lines[edit_nlines++] = i + 1;
+    }
+}
+
+/* Print all lines with 1-based line numbers. */
+static void edit_print(void)
+{
+    int i, j, start, end;
+    if (edit_nlines == 0) {
+        puts("(empty)");
+        return;
+    }
+    for (i = 0; i < edit_nlines; i++) {
+        print_string(" "); print_int(i + 1); print_string("| ");
+        start = edit_lines[i];
+        end = (i + 1 < edit_nlines) ? edit_lines[i + 1] - 1 : edit_len;
+        /* strip trailing newline from display */
+        if (end > start && edit_buf[end - 1] == '\n') end--;
+        for (j = start; j < end; j++)
+            putchar(edit_buf[j]);
+        putchar('\n');
+    }
+}
+
+/* Load file contents into the edit buffer.  If the file doesn't exist
+ * we start with an empty buffer (new file). */
+static int edit_load(char *path)
+{
+    int fd, n, total;
+    total = 0;
+    fd = sys_open(path);
+    if (fd >= 0) {
+        while (total < EDIT_BUF_SIZE - 1) {
+            n = sys_read(fd, &edit_buf[total], EDIT_BUF_SIZE - 1 - total);
+            if (n <= 0) break;
+            total += n;
+        }
+        sys_close(fd);
+    }
+    edit_buf[total] = 0;
+    edit_len = total;
+    edit_reindex();
+    return 0;
+}
+
+/* Save the edit buffer to the file.  Deletes the old file first,
+ * then creates a fresh inode and writes the buffer. */
+static int edit_save(void)
+{
+    int fd, i, written, parent, ino;
+    char *p, *name, *slash;
+    char tmp[32];
+
+    if (edit_path[0] == 0) { puts("no file"); return -1; }
+
+    /* delete old file if it exists (ignore failure) */
+    fs_unlink(edit_path);
+
+    /* parse path: split into parent directory + basename */
+    for (i = 0; edit_path[i] && i < 31; i++) tmp[i] = edit_path[i];
+    tmp[i] = 0;
+    p = tmp; name = tmp; slash = tmp;
+    while (*p) { if (*p == '/') slash = p; p++; }
+    if (*name == '/' && slash == name) {
+        parent = 0; name++;
+    } else if (*name == '/') {
+        *slash = 0; parent = fs_resolve(name); *slash = '/'; name = slash + 1;
+    } else {
+        parent = 0;
+    }
+
+    if (name[0] == 0) { puts("invalid path"); return -1; }
+    if (parent < 0 || fs_type[parent] != 2) { puts("parent not a dir"); return -1; }
+
+    ino = fs_ialloc(1, name);
+    if (ino < 0) { puts("inode alloc failed"); return -1; }
+    fs_dir_add(parent, name, ino);
+
+    fd = fd_alloc();
+    if (fd < 0) { puts("fd alloc failed"); return -1; }
+    fd_type[fd] = FD_FILE; fd_ino[fd] = ino; fd_offset[fd] = 0;
+    written = sys_write(fd, edit_buf, edit_len);
+    sys_close(fd);
+    printf("saved %d bytes to %s\n", written, edit_path);
+    return 0;
+}
+
+/* Append a line of text to the end of the buffer. */
+static void edit_append(char *text)
+{
+    int tlen, i;
+    tlen = strlen(text);
+    /* ensure there's room: possibly need an extra '\n' separator + text + '\n' */
+    if (edit_len + tlen + 2 >= EDIT_BUF_SIZE) {
+        puts("buffer full");
+        return;
+    }
+    if (edit_nlines >= EDIT_MAX_LINES) {
+        puts("too many lines");
+        return;
+    }
+    /* if the buffer doesn't end with a newline, add one to finish the last line */
+    if (edit_len > 0 && edit_buf[edit_len - 1] != '\n')
+        edit_buf[edit_len++] = '\n';
+    for (i = 0; i < tlen; i++)
+        edit_buf[edit_len++] = text[i];
+    edit_buf[edit_len++] = '\n';
+    edit_reindex();
+}
+
+/* Insert a line BEFORE line N (1-based).  The old line N becomes line N+1. */
+static void edit_insert(int line, char *text)
+{
+    int tlen, offset, i, shift;
+    if (line < 1 || line > edit_nlines) {
+        puts("invalid line number");
+        return;
+    }
+    if (edit_nlines >= EDIT_MAX_LINES) {
+        puts("too many lines");
+        return;
+    }
+    tlen = strlen(text);
+    if (edit_len + tlen + 1 >= EDIT_BUF_SIZE) {
+        puts("buffer full");
+        return;
+    }
+    offset = edit_lines[line - 1];
+    shift = tlen + 1;   /* text + newline */
+    /* shift existing text right to make room */
+    for (i = edit_len - 1; i >= offset; i--)
+        edit_buf[i + shift] = edit_buf[i];
+    /* insert new text + newline */
+    for (i = 0; i < tlen; i++)
+        edit_buf[offset + i] = text[i];
+    edit_buf[offset + tlen] = '\n';
+    edit_len += shift;
+    edit_reindex();
+}
+
+/* Delete line N (1-based). */
+static void edit_delete(int line)
+{
+    int start, end, len, i;
+    if (line < 1 || line > edit_nlines) {
+        puts("invalid line number");
+        return;
+    }
+    start = edit_lines[line - 1];
+    end = (line < edit_nlines) ? edit_lines[line] : edit_len;
+    len = end - start;
+    /* shift remaining text left */
+    for (i = end; i < edit_len; i++)
+        edit_buf[i - len] = edit_buf[i];
+    edit_len -= len;
+    edit_reindex();
+}
+
+/* Show help. */
+static void edit_help(void)
+{
+    puts("Commands:");
+    puts(" p           print all lines");
+    puts(" a <text>    append a line");
+    puts(" i <N> <txt> insert before line N");
+    puts(" d <N>       delete line N");
+    puts(" w           save to file");
+    puts(" q           quit editor");
+    puts(" h           this help");
+}
+
+/* Parse a positive integer, advance *next past it. */
+static int edit_parse_num(char *s, char **next)
+{
+    int n;
+    n = 0;
+    while (*s >= '0' && *s <= '9') {
+        n = n * 10 + (*s - '0');
+        s++;
+    }
+    if (next) *next = s;
+    return n;
+}
+
+/* Editor entry point.  Called from sh_exec_cmd("edit", path).
+ * Enters an interactive loop until the user quits. */
+void editor_task(char *path)
+{
+    char line[96];
+    char cmd;
+    int  lnum;
+    char *rest;
+    int  i;
+
+    /* copy path to static buffer */
+    for (i = 0; path[i] && i < 31; i++)
+        edit_path[i] = path[i];
+    edit_path[i] = 0;
+
+    if (path[0] == 0) {
+        puts("usage: edit <file>");
+        return;
+    }
+
+    edit_len = 0;
+    edit_nlines = 0;
+    edit_load(path);
+
+    printf("=== EDITOR: %s ===\n", edit_path);
+    edit_print();
+
+    while (1) {
+        putchar('>'); putchar(' ');
+        sh_readln(line, 96);
+        putchar('\n');
+
+        if (line[0] == 0) continue;
+
+        cmd = line[0];
+        rest = line + 1;
+        while (*rest == ' ' || *rest == '\t') rest++;
+
+        if (cmd == 'q') {
+            puts("bye.");
+            break;
+        } else if (cmd == 'h') {
+            edit_help();
+        } else if (cmd == 'p') {
+            edit_print();
+        } else if (cmd == 'w') {
+            edit_save();
+        } else if (cmd == 'a') {
+            if (rest[0] == 0)
+                puts("usage: a <text>");
+            else
+                edit_append(rest);
+        } else if (cmd == 'i') {
+            lnum = edit_parse_num(rest, &rest);
+            while (*rest == ' ' || *rest == '\t') rest++;
+            if (lnum < 1 || rest[0] == 0)
+                puts("usage: i <N> <text>");
+            else
+                edit_insert(lnum, rest);
+        } else if (cmd == 'd') {
+            lnum = edit_parse_num(rest, &rest);
+            if (lnum < 1)
+                puts("usage: d <N>");
+            else
+                edit_delete(lnum);
+        } else {
+            printf("? '%c'. h for help.\n", cmd);
+        }
     }
 }
 
